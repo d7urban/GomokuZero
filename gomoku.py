@@ -23,6 +23,19 @@ except ImportError:
     _accel = None
     _USE_ACCEL = False
 
+# select_child in older mcts_accel builds used the wrong value sign.
+# Keep other accel paths enabled, but use Python select_child unless the
+# extension advertises the fixed semantics.
+_USE_ACCEL_SELECT = _USE_ACCEL and bool(
+    getattr(_accel, "SELECT_CHILD_PARENT_VIEW", 0)
+)
+if _USE_ACCEL and not _USE_ACCEL_SELECT:
+    warnings.warn(
+        "mcts_accel missing SELECT_CHILD_PARENT_VIEW; "
+        "using Python select_child. Rebuild with setup_accel.py.",
+        RuntimeWarning,
+    )
+
 # ── Optional Numba acceleration for threat planes ─────────────────────────
 try:
     from numba import njit as _njit
@@ -534,7 +547,7 @@ def _select_child(node, c_puct):
     Only the selected child gets a MCTSNode allocated — unvisited moves
     are evaluated purely from their prior, avoiding ~90% of node allocations.
     """
-    if _USE_ACCEL:
+    if _USE_ACCEL_SELECT:
         return _accel.select_child(node, c_puct)
 
     sqrt_n = _sqrt(node.visit_count) if node.visit_count else 0.0
@@ -549,7 +562,9 @@ def _select_child(node, c_puct):
         child = children.get(moves[i])
         if child is not None:
             vc = child.visit_count
-            q = child.value_sum / vc if vc else 0.0
+            # child.q_value is from child-player perspective; flip sign so
+            # parent selects moves maximizing parent value.
+            q = -(child.value_sum / vc) if vc else 0.0
         else:
             vc = 0
             q = 0.0
@@ -667,7 +682,7 @@ def mcts_search_batched(game, model, num_simulations=200, batch_size=8,
                 # Virtual loss: make this child look worse so later paths
                 # in the same batch are pushed toward different leaves.
                 child.visit_count += 1
-                child.value_sum -= VIRTUAL_LOSS
+                child.value_sum += VIRTUAL_LOSS
                 path.append(child)
                 reward, done = scratch.make_move(*action)
                 depth += 1
@@ -747,7 +762,7 @@ def mcts_search_batched(game, model, num_simulations=200, batch_size=8,
             # Undo virtual loss on every non-root node in the path
             for n in path[1:]:
                 n.visit_count -= 1
-                n.value_sum += VIRTUAL_LOSS
+                n.value_sum -= VIRTUAL_LOSS
 
             # Standard backup (alternating sign)
             for n in reversed(path):
@@ -841,7 +856,7 @@ def mcts_select_leaves(ctx):
         while node.expanded:
             action, child = _select_child(node, c_puct)
             child.visit_count += 1
-            child.value_sum -= VIRTUAL_LOSS
+            child.value_sum += VIRTUAL_LOSS
             path.append(child)
             reward, done = scratch.make_move(*action)
             depth += 1
@@ -936,7 +951,7 @@ def mcts_process_results(ctx, batch_logits=None, batch_values=None):
 
         for n in path[1:]:
             n.visit_count -= 1
-            n.value_sum += VIRTUAL_LOSS
+            n.value_sum -= VIRTUAL_LOSS
 
         for n in reversed(path):
             n.visit_count += 1

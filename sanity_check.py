@@ -185,6 +185,74 @@ for trial in range(5):
     )
 
 
+# ── 3b. Tactical MCTS sanity (must take immediate win) ────────────────────
+print("\n[3b] MCTS tactical sanity (immediate win)")
+
+def _zero_predict(batch):
+    b = batch.shape[0]
+    logits = np.zeros((b, BOARD_SIZE * BOARD_SIZE), dtype=np.float32)
+    values = np.zeros((b, 1), dtype=np.float32)
+    return logits, values
+
+g_win = GomokuGame()
+forced_seq = [
+    (7, 7), (7, 6),
+    (7, 8), (6, 6),
+    (7, 9), (6, 7),
+    (7, 10), (6, 8),
+]
+for r, c in forced_seq:
+    reward, done = g_win.make_move(r, c)
+    if done:
+        break
+
+check(
+    "Setup: non-terminal position with P1 to move",
+    (not done) and g_win.current_player == PLAYER1,
+    f"done={done}, current_player={g_win.current_player}",
+)
+
+g_tmp = g_win.copy()
+reward_tmp, done_tmp = g_tmp.make_move(7, 11)
+check(
+    "Setup: (7,11) is an immediate winning move",
+    done_tmp and reward_tmp == 1,
+    f"done={done_tmp}, reward={reward_tmp}",
+)
+
+root_win = mcts_search(g_win, _zero_predict, num_simulations=96, add_noise=False)
+pi_win = mcts_policy(root_win, temperature=0.0)
+best_idx = int(np.argmax(pi_win))
+best_move = divmod(best_idx, BOARD_SIZE)
+check(
+    "Sequential MCTS takes immediate win",
+    best_move == (7, 11),
+    f"best={best_move}",
+)
+
+win_child = root_win.children.get((7, 11))
+check(
+    "Sequential MCTS: winning child scores as good for parent",
+    win_child is not None and (-win_child.q_value) > 0.9,
+    f"child_q={win_child.q_value if win_child is not None else 'missing'}",
+)
+
+root_win_b = mcts_search_batched(
+    g_win, _zero_predict,
+    num_simulations=96,
+    batch_size=8,
+    add_noise=False,
+)
+pi_win_b = mcts_policy(root_win_b, temperature=0.0)
+best_idx_b = int(np.argmax(pi_win_b))
+best_move_b = divmod(best_idx_b, BOARD_SIZE)
+check(
+    "Batched MCTS takes immediate win",
+    best_move_b == (7, 11),
+    f"best={best_move_b}",
+)
+
+
 # ── 4. Network prior NaN stress test (extreme logits) ─────────────────────
 print("\n[4] Masked softmax robustness (extreme inputs)")
 

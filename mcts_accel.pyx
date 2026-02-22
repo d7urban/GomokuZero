@@ -11,6 +11,9 @@ from libc.math cimport sqrt, exp, INFINITY
 
 np.import_array()
 
+# Capability flag consumed by gomoku.py to detect fixed select_child semantics.
+SELECT_CHILD_PARENT_VIEW = 1
+
 # ── _select_child (lazy expansion) ────────────────────────────────────────
 def select_child(node, double c_puct):
     """Pick child with highest UCB score.  Creates child lazily on first visit.
@@ -36,7 +39,9 @@ def select_child(node, double c_puct):
         if child is not None:
             vc = child.visit_count
             if vc > 0:
-                q = child.value_sum / <double>vc
+                # child.q_value is from child-player perspective; flip sign so
+                # parent selects moves maximizing parent value.
+                q = -(child.value_sum / <double>vc)
             else:
                 q = 0.0
         else:
