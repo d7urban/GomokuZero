@@ -11,7 +11,7 @@ Architecture: single-process, GPU-accelerated.
   • Self-play and training share one model in the main process.
   • Multiple games run concurrently with interleaved MCTS: leaf states
     from all active games are batched into a single GPU forward pass.
-  • Inline evaluation after each checkpoint.
+  • Inline evaluation at a separate cadence from checkpoint saves.
 """
 
 import numpy as np
@@ -43,7 +43,7 @@ from eval import (
 
 # ── Tunables ────────────────────────────────────────────────────────────────
 CONCURRENT_GAMES  = 16           # games interleaved on GPU simultaneously
-NUM_GAMES         = 5000         # total self-play games
+NUM_GAMES         = 10000         # total self-play games
 C_PUCT            = 1.5
 DIRICHLET_ALPHA   = 0.15
 NOISE_FRAC_START  = 0.35         # Dirichlet noise fraction (anneals down)
@@ -58,7 +58,8 @@ TRAIN_STEPS_RATIO = 4.0          # gradient steps = new_positions * ratio / BATC
 LR                = 1e-3
 WEIGHT_DECAY      = 1e-4
 VALUE_LOSS_COEFF  = 1.0          # weight on value loss (tune if v-loss dominates)
-SAVE_INTERVAL     = 200          # games between checkpoints
+SAVE_INTERVAL     = 750          # games between checkpoint saves
+EVAL_INTERVAL     = 200          # games between diagnostic/promotion checks
 
 # Batched MCTS — leaves evaluated per forward pass.
 # Smaller batches = more backup rounds = better-informed UCB selection.
@@ -101,23 +102,31 @@ RESIGN_MIN_MOVES     = 30       # don't check before this many moves
 
 # ── Inline evaluation ──────────────────────────────────────────────────────
 # Two-tier eval system:
-# 1. Diagnostic: lightweight t-1 check every checkpoint (SAVE_INTERVAL).
-#    Just prints Elo trend — no promotion gate.
-# 2. Promotion: eval vs current best, triggered when diagnostic win%
-#    exceeds threshold for consecutive checkpoints.  Promotes if Wilson
-#    95% CI lower bound > 50%.
+# 1. Diagnostic: lightweight check every EVAL_INTERVAL.
+#    Uses t-1 when evaluating a freshly saved checkpoint, otherwise compares
+#    current in-memory weights vs the latest saved checkpoint.
+#    Tracks a robust rolling signal (2 strong checks out of latest 3).
+# 2. Promotion: eval vs current best when diagnostic signal is strong.
 INLINE_EVAL_OPENINGS  = 30       # 30 openings × 2 colors = 60 games (diagnostic)
 PROMOTE_EVAL_OPENINGS = 60       # 60 openings × 2 colors = 120 games (promotion)
 DIAG_EVAL_SIMS        = 100      # lighter than self-play but enough for signal
 PROMOTE_EVAL_SIMS     = 200      # full sims for promotion decisions
-PROMOTE_DIAG_BLACK_PCT = 80.0    # Black win% that counts as "strong" diagnostic
-PROMOTE_CONSEC_NEEDED = 2        # consecutive strong diagnostics to trigger
+PROMOTE_DIAG_CI_LEVEL = 0.90     # confidence for diagnostic Black CI signal
+PROMOTE_DIAG_BLACK_LOWER = 0.50  # strong diagnostic if Black Wilson lower > this
+PROMOTE_DIAG_WINDOW = 3          # rolling diagnostic history length
+PROMOTE_DIAG_MIN_STRONG = 2      # require >= this many strong checks in window
 EMERG_LR_BLACK_PCT    = 40.0    # Black win% below which mild regression (2 consec)
 EMERG_LR_SEVERE_PCT   = 25.0   # Black win% below which severe regression (immediate)
 PROMOTE_COOLDOWN      = 400      # min games between promotion evals
 PROMOTE_CI_LEVEL      = 0.95     # confidence level for Wilson interval
+PROMOTE_BLACK_LOWER   = 0.60     # promotion requires Black Wilson lower > this
+PROMOTE_WHITE_SURVIVAL_MIN = 35.0   # avg moves survived in White losses
+PROMOTE_WHITE_NON_LOSS_MIN = 0.10   # min White non-loss rate (wins+draws)
+PROMOTE_WHITE_QUICK_LOSS_MAX = 85.0 # max quick-loss share among White losses
+PROMOTE_WHITE_QUICK_LOSS_MIN_LOSSES = 10  # apply quick-loss gate only with enough losses
+PROMOTE_WHITE_QUICK_LOSS_CHECK_NON_LOSS_MAX = 0.50  # apply quick-loss only if White non-loss is weak
 EMERG_LR_FACTOR       = 0.3     # multiply LR by this on emergency
-EMERG_LR_MIN_GAMES    = 2000    # don't fire emergency before this many games
+EMERG_LR_MIN_GAMES    = 1000    # don't fire emergency before this many games
 
 # ── Plateau detection ────────────────────────────────────────────────────────
 class PlateauDetector:
@@ -500,7 +509,8 @@ def _set_optimizer_state(optimizer, state):
             var.assign(val)
 
 
-def _save_training_state(game_count, optimizer, replay, lr_scheduler=None):
+def _save_training_state(game_count, optimizer, replay, lr_scheduler=None,
+                         eval_state=None):
     """Persist everything needed for a seamless resume."""
     opt_weights = _get_optimizer_state(optimizer)
 
@@ -511,6 +521,8 @@ def _save_training_state(game_count, optimizer, replay, lr_scheduler=None):
     }
     if lr_scheduler is not None:
         state["lr_scheduler"] = lr_scheduler.get_state()
+    if eval_state is not None:
+        state["eval_state"] = eval_state
 
     with open(_STATE_PATH, "wb") as f:
         pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -523,9 +535,10 @@ def _save_training_state(game_count, optimizer, replay, lr_scheduler=None):
 
 
 def _load_training_state(model, optimizer, replay):
-    """Restore optimizer state and replay buffer.  Returns (starting_game, lr_state)."""
+    """Restore optimizer/replay state. Returns (starting_game, lr_state, eval_state)."""
     starting_game = 0
     lr_state = None
+    eval_state = None
 
     cfg_path = _STATE_PATH
     if not os.path.exists(cfg_path):
@@ -540,6 +553,7 @@ def _load_training_state(model, optimizer, replay):
 
             opt_weights = cfg.get("optimizer_weights")
             lr_state = cfg.get("lr_scheduler")
+            eval_state = cfg.get("eval_state")
             if opt_weights is not None:
                 saved_w = [w.numpy() for w in model.trainable_variables]
                 dummy_s = np.zeros((1, BOARD_SIZE, BOARD_SIZE, NUM_INPUT_PLANES), dtype=np.float32)
@@ -570,7 +584,7 @@ def _load_training_state(model, optimizer, replay):
             print(f"  Warning: could not load replay buffer: {e}")
             print("  Starting with empty buffer (will refill via self-play).")
 
-    return starting_game, lr_state
+    return starting_game, lr_state, eval_state
 
 
 # ── Interleaved self-play (multiple games, shared GPU inference) ────────────
@@ -839,6 +853,14 @@ def _save_best_state(state):
         pickle.dump(state, f)
 
 
+def _save_timestamped_checkpoint(model, game_count):
+    """Save a timestamped checkpoint and return the file path."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    cp_file = f"weights/gomoku_{ts}_g{game_count:05d}.weights.h5"
+    model.save_weights(cp_file)
+    return cp_file
+
+
 def _wilson_lower(wins, n, z=1.96):
     """Wilson score lower confidence bound.
 
@@ -856,7 +878,7 @@ def _wilson_lower(wins, n, z=1.96):
 
 
 def _run_diagnostic_eval(model, game_count, eval_openings, opp_model):
-    """Lightweight eval vs previous checkpoint — prints per-color trends.
+    """Lightweight eval vs recent checkpoint — prints per-color trends.
 
     Returns result dict or None if eval couldn't run.
     """
@@ -864,16 +886,32 @@ def _run_diagnostic_eval(model, game_count, eval_openings, opp_model):
     if not checkpoints:
         return None
 
-    current_idx = None
-    for i, (gc, fp) in enumerate(checkpoints):
+    # If evaluating immediately after a save, compare the new checkpoint
+    # against t-1. Otherwise compare current in-memory weights against the
+    # latest saved checkpoint.
+    near_idx = None
+    for i in range(len(checkpoints) - 1, -1, -1):
+        gc = checkpoints[i][0]
         if abs(gc - game_count) <= 10:
-            current_idx = i
+            near_idx = i
             break
-    if current_idx is None or current_idx < 1:
-        return None
 
-    gc_prev, fp_prev = checkpoints[current_idx - 1]
-    label = f"t-1 (g{gc_prev})"
+    if near_idx is not None:
+        if near_idx < 1:
+            return None
+        gc_prev, fp_prev = checkpoints[near_idx - 1]
+        label = f"t-1 (g{gc_prev})"
+    else:
+        older_idx = None
+        for i in range(len(checkpoints) - 1, -1, -1):
+            gc = checkpoints[i][0]
+            if gc < game_count:
+                older_idx = i
+                break
+        if older_idx is None:
+            return None
+        gc_prev, fp_prev = checkpoints[older_idx]
+        label = f"latest cp (g{gc_prev})"
 
     print(f"  ── Diag g{game_count} vs {label} ──", flush=True)
     opp_model.load_weights(fp_prev)
@@ -886,32 +924,43 @@ def _run_diagnostic_eval(model, game_count, eval_openings, opp_model):
     return result
 
 
+def _sample_eval_openings(all_openings, n_openings, seed):
+    """Sample a reproducible subset of openings."""
+    if not all_openings:
+        return []
+    rng = np.random.RandomState(seed)
+    n_openings = min(n_openings, len(all_openings))
+    idxs = rng.choice(len(all_openings), size=n_openings, replace=False)
+    return [all_openings[i] for i in idxs]
+
+
 def _run_promotion_eval(model, game_count, all_openings, best_state, opp_model):
     """Promotion eval vs current best checkpoint — promotes if both colors improved.
 
-    Triggered when consecutive diagnostic Black win% exceeds threshold.
-    Uses full sims (100) and a fresh random subset of openings.
+    Triggered by rolling diagnostic signal (2 strong checks out of latest 3).
+    Uses full sims and a fresh random subset of openings.
 
     Promotion gate (per-color):
-      - Black: Wilson lower CI of Black win rate > 60%
-        (confirms strong attack; easily met if true rate is 85%+)
-      - White: at least 1 win, OR avg loss survival > 35 moves
-        (confirms defensive ability hasn't collapsed)
+      - Black: Wilson lower CI of Black score (win=1/draw=0.5/loss=0)
+        must exceed PROMOTE_BLACK_LOWER.
+      - White: must not collapse defensively
+        (minimum non-loss rate, bounded quick-loss rate, and wins or survival).
     """
     best_gc = best_state.get("game_count", 0)
 
-    # Find the checkpoint we just saved
+    # Reuse a checkpoint at this game count if one exists (e.g. save+eval
+    # coincide); otherwise only write a new checkpoint when promotion succeeds.
     checkpoints = find_checkpoints()
     cp_file = None
-    for gc, fp in checkpoints:
+    for gc, fp in reversed(checkpoints):
         if abs(gc - game_count) <= 10:
             cp_file = fp
             break
-    if cp_file is None:
-        return best_state
 
     if not os.path.exists(BEST_WEIGHTS_FILE):
         # No best yet — auto-promote
+        if cp_file is None:
+            cp_file = _save_timestamped_checkpoint(model, game_count)
         shutil.copy2(cp_file, BEST_WEIGHTS_FILE)
         best_state = {
             "path": cp_file,
@@ -922,16 +971,10 @@ def _run_promotion_eval(model, game_count, all_openings, best_state, opp_model):
         print(f"  ★ Auto-promoted to best (no previous best)", flush=True)
         return best_state
 
-    if abs(game_count - best_gc) < PROMOTE_COOLDOWN:
-        print(f"  (skip promotion: current best g{best_gc:05d} is recent)",
-              flush=True)
-        return best_state
-
     # Sample a fresh subset of openings (reproducible per game_count)
-    rng = np.random.RandomState(game_count)
-    n_openings = min(PROMOTE_EVAL_OPENINGS, len(all_openings))
-    indices = rng.choice(len(all_openings), size=n_openings, replace=False)
-    eval_openings = [all_openings[i] for i in indices]
+    eval_openings = _sample_eval_openings(
+        all_openings, PROMOTE_EVAL_OPENINGS, seed=game_count
+    )
 
     label = f"best (g{best_gc})"
     print(f"  ── Promotion eval g{game_count} vs {label} ──", flush=True)
@@ -947,22 +990,42 @@ def _run_promotion_eval(model, game_count, all_openings, best_state, opp_model):
     z = 1.96 if PROMOTE_CI_LEVEL >= 0.95 else 1.645
 
     # ── Per-color gates ──
-    # Black: Wilson lower CI on Black win rate must exceed 60%
+    # Black: Wilson lower CI on score (win=1, draw=0.5, loss=0)
     bw = result["black_wins"]
     bl = result["black_losses"]
-    bn = bw + bl  # ignoring draws (rare in Gomoku)
-    black_lower = _wilson_lower(bw, bn, z=z) if bn > 0 else 0.0
+    bd = result.get("black_draws", 0)
+    bn = bw + bl + bd
+    black_score = bw + 0.5 * bd
+    black_lower = _wilson_lower(black_score, bn, z=z) if bn > 0 else 0.0
 
-    # White: must show some defensive capability
+    # White: must show defensive robustness
     ww = result["white_wins"]
     wl = result["white_losses"]
+    wd = result.get("white_draws", 0)
+    white_total = ww + wl + wd
+    white_non_loss_rate = (ww + wd) / max(1, white_total)
+    white_quick_loss_rate = result["white_quick_loss_rate"]
     white_survival = result["avg_white_loss_moves"]
-    white_ok = (ww > 0) or (white_survival >= 35)
+    white_quick_loss_required = (
+        wl >= PROMOTE_WHITE_QUICK_LOSS_MIN_LOSSES
+        and white_non_loss_rate < PROMOTE_WHITE_QUICK_LOSS_CHECK_NON_LOSS_MAX
+    )
+    white_quick_loss_ok = (
+        not white_quick_loss_required
+        or white_quick_loss_rate <= PROMOTE_WHITE_QUICK_LOSS_MAX
+    )
+    white_ok = (
+        white_non_loss_rate >= PROMOTE_WHITE_NON_LOSS_MIN
+        and white_quick_loss_ok
+        and (ww > 0 or white_survival >= PROMOTE_WHITE_SURVIVAL_MIN)
+    )
 
-    black_ok = black_lower > 0.60
+    black_ok = black_lower > PROMOTE_BLACK_LOWER
     promoted = black_ok and white_ok
 
     if promoted:
+        if cp_file is None:
+            cp_file = _save_timestamped_checkpoint(model, game_count)
         shutil.copy2(cp_file, BEST_WEIGHTS_FILE)
         best_state = {
             "path": cp_file,
@@ -970,17 +1033,38 @@ def _run_promotion_eval(model, game_count, all_openings, best_state, opp_model):
             "elo_vs_long": result["elo_delta"],
         }
         _save_best_state(best_state)
-        white_reason = (f"W wins={ww}" if ww > 0
-                        else f"W survival={white_survival:.0f}")
+        white_reason = (
+            f"W non-loss={100.0 * white_non_loss_rate:.0f}% "
+            f"quick-loss={white_quick_loss_rate:.0f}% "
+            + (f"wins={ww}" if ww > 0 else f"survival={white_survival:.0f}")
+        )
         print(f"  ★ Promoted to best "
-              f"(B CI>{black_lower:.0%}, {white_reason}, "
+              f"(B lower={black_lower:.0%}>{PROMOTE_BLACK_LOWER:.0%}, "
+              f"{white_reason}, "
               f"Elo Δ{result['elo_delta']:+.0f})", flush=True)
     else:
         reasons = []
         if not black_ok:
-            reasons.append(f"B CI={black_lower:.0%}≤60%")
+            reasons.append(
+                f"B lower={black_lower:.0%}≤{PROMOTE_BLACK_LOWER:.0%}"
+            )
         if not white_ok:
-            reasons.append(f"W wins=0, survival={white_survival:.0f}<35")
+            if white_non_loss_rate < PROMOTE_WHITE_NON_LOSS_MIN:
+                reasons.append(
+                    f"W non-loss={100.0 * white_non_loss_rate:.0f}%"
+                    f"<{100.0 * PROMOTE_WHITE_NON_LOSS_MIN:.0f}%"
+                )
+            if (white_quick_loss_required
+                    and white_quick_loss_rate > PROMOTE_WHITE_QUICK_LOSS_MAX):
+                reasons.append(
+                    f"W quick-loss={white_quick_loss_rate:.0f}%"
+                    f">{PROMOTE_WHITE_QUICK_LOSS_MAX:.0f}%"
+                )
+            if ww == 0 and white_survival < PROMOTE_WHITE_SURVIVAL_MIN:
+                reasons.append(
+                    f"W wins=0, survival={white_survival:.0f}"
+                    f"<{PROMOTE_WHITE_SURVIVAL_MIN:.0f}"
+                )
         print(f"  (best remains g{best_gc:05d} — {', '.join(reasons)})",
               flush=True)
 
@@ -1017,14 +1101,16 @@ def main():
             shutil.rmtree("weights", ignore_errors=True)
             os.makedirs("weights", exist_ok=True)
             lr_state = None
+            eval_state = None
             print("  Deleted weights/ — starting fresh.\n")
         else:
             model.load_weights(weights_file)
-            starting_game, lr_state = _load_training_state(
+            starting_game, lr_state, eval_state = _load_training_state(
                 model, optimizer, replay)
             print("  Loaded existing weights.\n")
     else:
         lr_state = None
+        eval_state = None
         print("  No existing weights — starting fresh.\n")
 
     # Automatic LR scheduling: warmup ramp then plateau-based reduction
@@ -1055,8 +1141,10 @@ def main():
         print("Threat planes: numba (~3μs, JIT warmup on first call)")
     else:
         print("Threat planes: numpy fallback (~150μs, rebuild Cython or pip install numba)")
-    print(f"Eval: diagnostic vs t-1 every {SAVE_INTERVAL}g ({DIAG_EVAL_SIMS} sims), "
-          f"promotion vs best after {PROMOTE_CONSEC_NEEDED}× Black≥{PROMOTE_DIAG_BLACK_PCT:.0f}% "
+    print(f"Checkpoints: save every {SAVE_INTERVAL}g")
+    print(f"Eval: diagnostic every {EVAL_INTERVAL}g ({DIAG_EVAL_SIMS} sims), "
+          f"promotion trigger: {PROMOTE_DIAG_MIN_STRONG}/{PROMOTE_DIAG_WINDOW} "
+          f"diag checks with Black lower>{PROMOTE_DIAG_BLACK_LOWER:.0%} "
           f"({PROMOTE_EVAL_SIMS} sims, per-color Wilson CI)")
     print(f"Concurrent games: {CONCURRENT_GAMES}, target: {NUM_GAMES}")
     print(f"Best-opponent: {BEST_PLAY_FRAC:.0%} of games vs best checkpoint")
@@ -1089,8 +1177,7 @@ def main():
     # Eval: fixed opening book persisted to disk
     full_openings = load_or_create_openings(
         max(PROMOTE_EVAL_OPENINGS, 150))
-    diag_openings = full_openings[:INLINE_EVAL_OPENINGS]
-    # Promotion samples from full pool each time (see _run_promotion_eval)
+    # Diagnostic and promotion both sample from this pool each eval tick.
 
     # Training: book openings for plausible midgame starts
     try:
@@ -1131,7 +1218,18 @@ def main():
     game_count = starting_game
     target = starting_game + NUM_GAMES
     interrupted = False
-    consec_strong_diags = 0  # consecutive diagnostics above win% threshold
+    diag_strong_history = deque(maxlen=PROMOTE_DIAG_WINDOW)
+    promotion_pending = False
+    if eval_state:
+        saved_hist = eval_state.get("diag_strong_history", [])
+        if isinstance(saved_hist, (list, tuple)):
+            for v in saved_hist[-PROMOTE_DIAG_WINDOW:]:
+                diag_strong_history.append(bool(v))
+        promotion_pending = bool(eval_state.get("promotion_pending", False))
+        if diag_strong_history or promotion_pending:
+            print("  Restored promotion trigger state: "
+                  f"window={int(sum(diag_strong_history))}/{len(diag_strong_history)} strong, "
+                  f"pending={'yes' if promotion_pending else 'no'}")
     emerg_lr_fired = False   # emergency LR cut: fires once per regression episode
     consec_mild_regress = 0  # consecutive diagnostics in 30-40% range
 
@@ -1287,15 +1385,21 @@ def main():
                 if lr_msg:
                     print("  " + lr_msg, flush=True)
 
-            # ── Checkpoint ──────────────────────────────────────────────
-            prev_cp = (game_count - len(move_counts)) // SAVE_INTERVAL
-            curr_cp = game_count // SAVE_INTERVAL
-            if curr_cp > prev_cp:
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                cp_file = f"weights/gomoku_{ts}_g{game_count:05d}.weights.h5"
-                model.save_weights(cp_file)
+            prev_game_count = game_count - len(move_counts)
+
+            # ── Checkpoint save schedule ────────────────────────────────
+            prev_save_tick = prev_game_count // SAVE_INTERVAL
+            curr_save_tick = game_count // SAVE_INTERVAL
+            if curr_save_tick > prev_save_tick:
+                cp_file = _save_timestamped_checkpoint(model, game_count)
                 model.save_weights(weights_file)
-                _save_training_state(game_count, optimizer, replay, lr_scheduler)
+                _save_training_state(
+                    game_count, optimizer, replay, lr_scheduler,
+                    eval_state={
+                        "diag_strong_history": list(diag_strong_history),
+                        "promotion_pending": bool(promotion_pending),
+                    },
+                )
                 print(f"  → Checkpoint {cp_file}", flush=True)
 
                 # Auto-promote first checkpoint as best so vs-best can start
@@ -1317,16 +1421,45 @@ def main():
                     print(f"  ★ Auto-promoted g{game_count} as first best",
                           flush=True)
 
-                # Diagnostic: lightweight t-1 eval every checkpoint
+            # ── Eval/promotion schedule (independent from checkpoint saves) ──
+            prev_eval_tick = prev_game_count // EVAL_INTERVAL
+            curr_eval_tick = game_count // EVAL_INTERVAL
+            if curr_eval_tick > prev_eval_tick:
+                diag_openings = _sample_eval_openings(
+                    full_openings, INLINE_EVAL_OPENINGS, seed=game_count
+                )
                 diag_result = _run_diagnostic_eval(
                     model, game_count, diag_openings, opp_model)
 
-                # Extract per-color metrics
+                # Extract per-color metrics and update rolling promotion signal
                 diag_black_pct = (diag_result["black_win_pct"]
                                   if diag_result else None)
+                diag_black_lower = None
+                diag_strong = False
+                if diag_result is not None:
+                    diag_bw = diag_result["black_wins"]
+                    diag_bl = diag_result["black_losses"]
+                    diag_bd = diag_result.get("black_draws", 0)
+                    diag_bn = diag_bw + diag_bl + diag_bd
+                    diag_black_score = diag_bw + 0.5 * diag_bd
+                    diag_z = 1.96 if PROMOTE_DIAG_CI_LEVEL >= 0.95 else 1.645
+                    diag_black_lower = (
+                        _wilson_lower(diag_black_score, diag_bn, z=diag_z)
+                        if diag_bn > 0 else 0.0
+                    )
+                    diag_strong = (diag_black_lower >= PROMOTE_DIAG_BLACK_LOWER)
+                    diag_strong_history.append(diag_strong)
+                    strong_n = int(sum(diag_strong_history))
+                    print(
+                        f"  Diag trigger signal: Black lower={diag_black_lower:.0%} "
+                        f"({'strong' if diag_strong else 'weak'}), "
+                        f"window={strong_n}/{len(diag_strong_history)} strong",
+                        flush=True,
+                    )
 
                 # Emergency LR drop on eval regression (per Black win%)
-                # Black should win 90%+ vs t-1; dropping means regression.
+                # Black should win 90%+ vs the diagnostic opponent; dropping
+                # indicates regression.
                 # (skip early: random-vs-random evals are meaningless)
                 if (diag_black_pct is not None and not emerg_lr_fired
                         and game_count >= EMERG_LR_MIN_GAMES):
@@ -1362,39 +1495,50 @@ def main():
                             emerg_lr_fired = True
                             consec_mild_regress = 0
                             print(f"  ⚠ Emergency LR cut: {old_lr:.2e} → {new_lr:.2e} "
-                                  f"(Black <{EMERG_LR_BLACK_PCT:.0f}% for 2 checkpoints)",
+                                  f"(Black <{EMERG_LR_BLACK_PCT:.0f}% for 2 diagnostics)",
                                   flush=True)
                     else:
                         consec_mild_regress = 0
-                if (diag_black_pct is not None
-                        and diag_black_pct >= PROMOTE_DIAG_BLACK_PCT):
+                if diag_strong:
                     emerg_lr_fired = False
                     consec_mild_regress = 0
 
-                # Track consecutive strong diagnostics (Black win% based)
-                if (diag_black_pct is not None
-                        and diag_black_pct >= PROMOTE_DIAG_BLACK_PCT):
-                    consec_strong_diags += 1
-                else:
-                    consec_strong_diags = 0
+                # Promotion trigger: >=2 strong diagnostics in latest 3 checks.
+                if (len(diag_strong_history) == PROMOTE_DIAG_WINDOW
+                        and sum(diag_strong_history) >= PROMOTE_DIAG_MIN_STRONG):
+                    if not promotion_pending:
+                        print("  → Promotion trigger armed (rolling diagnostics)",
+                              flush=True)
+                    promotion_pending = True
 
-                # Promotion: if N consecutive strong diagnostics
-                if consec_strong_diags >= PROMOTE_CONSEC_NEEDED:
-                    old_best_gc = best_state.get("game_count", 0)
-                    best_state = _run_promotion_eval(
-                        model, game_count, full_openings,
-                        best_state, opp_model)
-                    consec_strong_diags = 0  # reset after attempt
+                # Keep trigger pending through cooldown; run once cooldown clears.
+                if promotion_pending:
+                    best_gc = best_state.get("game_count", 0)
+                    since_best = abs(game_count - best_gc)
+                    if since_best < PROMOTE_COOLDOWN:
+                        wait = PROMOTE_COOLDOWN - since_best
+                        print(
+                            f"  (promotion pending: cooldown {since_best}/{PROMOTE_COOLDOWN}g, "
+                            f"wait {wait}g)",
+                            flush=True,
+                        )
+                    else:
+                        old_best_gc = best_state.get("game_count", 0)
+                        best_state = _run_promotion_eval(
+                            model, game_count, full_openings,
+                            best_state, opp_model)
+                        promotion_pending = False
+                        diag_strong_history.clear()
 
-                    # Reload best model if promotion happened
-                    if best_state.get("game_count", 0) != old_best_gc:
-                        if best_model is None:
-                            best_model = create_model()
-                        best_model.load_weights(BEST_WEIGHTS_FILE)
-                        best_predict_fn = make_predict_fn(best_model)
-                        best_predict_fn(np.zeros(
-                            (1, BOARD_SIZE, BOARD_SIZE, NUM_INPUT_PLANES),
-                            dtype=np.float32))
+                        # Reload best model if promotion happened
+                        if best_state.get("game_count", 0) != old_best_gc:
+                            if best_model is None:
+                                best_model = create_model()
+                            best_model.load_weights(BEST_WEIGHTS_FILE)
+                            best_predict_fn = make_predict_fn(best_model)
+                            best_predict_fn(np.zeros(
+                                (1, BOARD_SIZE, BOARD_SIZE, NUM_INPUT_PLANES),
+                                dtype=np.float32))
 
     except KeyboardInterrupt:
         interrupted = True
@@ -1408,7 +1552,13 @@ def main():
     model.save_weights(f"weights/gomoku_{ts}_{tag}.weights.h5")
     model.save_weights(weights_file)
 
-    _save_training_state(game_count, optimizer, replay, lr_scheduler)
+    _save_training_state(
+        game_count, optimizer, replay, lr_scheduler,
+        eval_state={
+            "diag_strong_history": list(diag_strong_history),
+            "promotion_pending": bool(promotion_pending),
+        },
+    )
 
     if interrupted:
         print(f"\n✓ State saved at game {game_count}.  Resume with: python train.py")
