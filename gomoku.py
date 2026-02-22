@@ -40,16 +40,19 @@ PLAYER1 = 1
 NUM_INPUT_PLANES = 6
 PLAYER2 = -1
 
-# Prior floor: disabled. With 200 sims and peaked prior, top moves get
-# enough visits for value-based evaluation. Uniform blend destroys signal.
-PRIOR_UNIFORM_BLEND = 0.0
+# Prior floor: small blend to bootstrap exploration. With random networks,
+# both prior and value are noise — MCTS needs SOME forced exploration so the
+# value head can learn from diverse positions. 0.05 gives a tiny floor
+# (0.05/30 ≈ 0.17% per move) without flattening a peaked learned prior.
+# 0.25 was too much (destroyed signal); 0.0 was too little (no bootstrapping).
+PRIOR_UNIFORM_BLEND = 0.05
 
 
 # ── Game ────────────────────────────────────────────────────────────────────
 class GomokuGame:
     """Five In A Row game logic."""
 
-    _FRONTIER_DIST = 2  # must match get_candidate_moves distance
+    _FRONTIER_DIST = 1  # distance-1 neighbours only → ~30-40 candidates
 
     def __init__(self, size=BOARD_SIZE):
         self.size = size
@@ -377,13 +380,13 @@ def make_predict_fn(model):
 
 
 # ── Nearby-moves optimisation ──────────────────────────────────────────────
-def get_candidate_moves(board, distance=2, density_threshold=8, frontier=None):
+def get_candidate_moves(board, distance=1, density_threshold=2, frontier=None):
     """Return candidate empty squares for MCTS expansion.
 
     When fewer than `density_threshold` stones are on the board, returns ALL
-    empty squares so the policy head gets full-board supervision in openings.
-    Once the board is denser, restricts to squares within `distance` of any
-    occupied square for efficiency.
+    empty squares.  Once denser, restricts to squares within `distance` of
+    any occupied square.  With distance=1 and typical positions, this gives
+    12-50 candidates — enough for 100 sims to produce meaningful visits.
 
     If `frontier` is provided (incremental count array from GomokuGame),
     uses a fast np.where instead of dilation.

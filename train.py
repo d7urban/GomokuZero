@@ -66,18 +66,18 @@ SAVE_INTERVAL     = 200          # games between checkpoints
 MCTS_BATCH_SIZE   = 8
 
 # Self-play simulation budget
-MCTS_SIMS         = 200          # full-search sims (for policy training)
+MCTS_SIMS         = 100          # full-search sims (for policy training)
 
 # Playout cap randomization: most moves get a fast search (value only),
 # some get a full search (policy + value).  This generates more games
 # for the value head while preserving policy quality.
-PCAP_FAST_SIMS    = 40           # sims for fast-search moves
+PCAP_FAST_SIMS    = 20           # sims for fast-search moves
 PCAP_FULL_FRAC    = 0.50         # fraction of moves that get full search
 
 # Asymmetric self-play: in a fraction of games, one side is randomly
 # weakened to produce decisive results and train the value head.
 # The fraction decays linearly so training converges to symmetric play.
-ASYM_WEAK_SIMS    = 80           # sims for the weakened side
+ASYM_WEAK_SIMS    = 40           # sims for the weakened side
 ASYM_FRAC_START   = 0.5          # asymmetric fraction at game 0
 ASYM_FRAC_END     = 0.1          # asymmetric fraction after decay period
 ASYM_DECAY_GAMES  = 3000         # linear decay over this many games
@@ -108,8 +108,8 @@ RESIGN_MIN_MOVES     = 30       # don't check before this many moves
 #    95% CI lower bound > 50%.
 INLINE_EVAL_OPENINGS  = 30       # 30 openings × 2 colors = 60 games (diagnostic)
 PROMOTE_EVAL_OPENINGS = 60       # 60 openings × 2 colors = 120 games (promotion)
-DIAG_EVAL_SIMS        = 50       # fewer sims for fast diagnostic
-PROMOTE_EVAL_SIMS     = 100      # full sims for promotion decision
+DIAG_EVAL_SIMS        = 200      # match self-play sims so eval reflects real strength
+PROMOTE_EVAL_SIMS     = 200      # match self-play sims for accurate promotion
 PROMOTE_DIAG_BLACK_PCT = 80.0    # Black win% that counts as "strong" diagnostic
 PROMOTE_CONSEC_NEEDED = 2        # consecutive strong diagnostics to trigger
 EMERG_LR_BLACK_PCT    = 40.0    # Black win% below which mild regression (2 consec)
