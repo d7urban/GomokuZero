@@ -345,12 +345,26 @@ def _play_eval_game_seq(candidate_fn, opponent_fn, candidate_color,
         idx = int(np.argmax(pi))
         row, col = divmod(idx, BOARD_SIZE)
 
+        # HARD TRIPWIRE: crash on illegal moves
+        assert game.board[row, col] == 0, (
+            f"ILLEGAL MOVE ({row},{col}) at move {move_num}, "
+            f"board[{row},{col}]={game.board[row, col]}, "
+            f"stones={int(np.count_nonzero(game.board))}"
+        )
+
         reward, done = game.make_move(row, col)
         move_num += 1
 
     if reward == 0:
         return None, move_num, candidate_color
-    winner = game.current_player
+    # reward == 1  => current player made 5-in-a-row
+    # reward == -1 => current player made an illegal move, so they lose
+    if reward == 1:
+        winner = game.current_player
+    elif reward == -1:
+        winner = -game.current_player
+    else:
+        raise RuntimeError(f"Unexpected terminal reward: {reward}")
     candidate_won = (winner == candidate_color)
     return candidate_won, move_num, candidate_color
 

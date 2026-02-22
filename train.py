@@ -108,8 +108,8 @@ RESIGN_MIN_MOVES     = 30       # don't check before this many moves
 #    95% CI lower bound > 50%.
 INLINE_EVAL_OPENINGS  = 30       # 30 openings × 2 colors = 60 games (diagnostic)
 PROMOTE_EVAL_OPENINGS = 60       # 60 openings × 2 colors = 120 games (promotion)
-DIAG_EVAL_SIMS        = 200      # match self-play sims so eval reflects real strength
-PROMOTE_EVAL_SIMS     = 200      # match self-play sims for accurate promotion
+DIAG_EVAL_SIMS        = 100      # lighter than self-play but enough for signal
+PROMOTE_EVAL_SIMS     = 200      # full sims for promotion decisions
 PROMOTE_DIAG_BLACK_PCT = 80.0    # Black win% that counts as "strong" diagnostic
 PROMOTE_CONSEC_NEEDED = 2        # consecutive strong diagnostics to trigger
 EMERG_LR_BLACK_PCT    = 40.0    # Black win% below which mild regression (2 consec)
@@ -768,6 +768,15 @@ def _play_games_interleaved(predict_fn, game_configs, best_predict_fn=None,
                         g.soft_resigned = True
 
                 row, col = select_action(pi)
+
+                # HARD TRIPWIRE: crash on illegal moves
+                assert g.game.board[row, col] == 0, (
+                    f"ILLEGAL MOVE ({row},{col}) at move {g.move_num}, "
+                    f"board[{row},{col}]={g.game.board[row, col]}, "
+                    f"MCTS children={len(root.children) if hasattr(root, 'children') else '?'}, "
+                    f"stones={int(np.count_nonzero(g.game.board))}"
+                )
+
                 reward, done = g.game.make_move(row, col)
                 g.move_num += 1
 

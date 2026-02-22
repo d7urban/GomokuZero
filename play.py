@@ -152,6 +152,11 @@ def play_game_curses(stdscr, ai, game):
             msg = f"AI thinking ({ai.sims} sims) …"
             draw_board(stdscr, game, cr, cc, msg)
             row, col, val = ai.get_move(game)
+            assert game.board[row, col] == 0, (
+                f"ILLEGAL AI MOVE ({row},{col}), "
+                f"board={game.board[row, col]}, "
+                f"stones={int(np.count_nonzero(game.board))}"
+            )
             reward, done = game.make_move(row, col)
             if done:
                 end = "AI wins!" if reward == 1 else "Draw!"
