@@ -72,13 +72,13 @@ def select_weights(use_latest=False):
 
 
 # ── Curses UI ───────────────────────────────────────────────────────────────
-def draw_board(stdscr, game, cursor_row, cursor_col, message=""):
+def draw_board(stdscr, game, cursor_row, cursor_col, human_player, message=""):
     stdscr.clear()
     stdscr.addstr(0, 2, "=== FIVE IN A ROW (GOMOKU) ===", curses.A_BOLD)
     stdscr.addstr(1, 2, "Arrows: move | SPACE: place | U: undo | Q: quit")
 
     # Column header
-    hdr = "    " + "".join(f"{c:3d}" for c in range(game.size))
+    hdr = "   " + "".join(f"{c:3d}" for c in range(game.size))
     stdscr.addstr(3, 0, hdr)
 
     start = 4
@@ -94,7 +94,9 @@ def draw_board(stdscr, game, cursor_row, cursor_col, message=""):
         stdscr.addstr(start + r, 0, line)
 
     srow = start + game.size + 2
-    turn = "Your turn (X)" if game.current_player == PLAYER1 else "AI thinking (O)"
+    side = "X" if game.current_player == PLAYER1 else "O"
+    actor = "Your turn" if game.current_player == human_player else "AI thinking"
+    turn = f"{actor} ({side})"
     stdscr.addstr(srow, 2, f"Status: {turn}")
     if message:
         stdscr.addstr(srow + 1, 2, message, curses.A_BOLD)
@@ -120,9 +122,11 @@ def play_game_curses(stdscr, ai, game):
         if k in (ord("n"), ord("N")):
             human_turn = False; msg = "AI goes first …"; break
 
+    human_player = PLAYER1 if human_turn else PLAYER2
+
     game_over = False
     while not game_over:
-        draw_board(stdscr, game, cr, cc, msg)
+        draw_board(stdscr, game, cr, cc, human_player, msg)
         msg = ""
 
         if human_turn:
@@ -144,13 +148,16 @@ def play_game_curses(stdscr, ai, game):
                 reward, done = game.make_move(cr, cc)
                 if done:
                     end = "You win!" if reward == 1 else "Draw!"
-                    draw_board(stdscr, game, cr, cc, f"{end}  Press any key …")
+                    draw_board(
+                        stdscr, game, cr, cc, human_player,
+                        f"{end}  Press any key …"
+                    )
                     stdscr.getch(); game_over = True
                 else:
                     human_turn = False
         else:
             msg = f"AI thinking ({ai.sims} sims) …"
-            draw_board(stdscr, game, cr, cc, msg)
+            draw_board(stdscr, game, cr, cc, human_player, msg)
             row, col, val = ai.get_move(game)
             assert game.board[row, col] == 0, (
                 f"ILLEGAL AI MOVE ({row},{col}), "
@@ -160,7 +167,10 @@ def play_game_curses(stdscr, ai, game):
             reward, done = game.make_move(row, col)
             if done:
                 end = "AI wins!" if reward == 1 else "Draw!"
-                draw_board(stdscr, game, cr, cc, f"{end}  Press any key …")
+                draw_board(
+                    stdscr, game, cr, cc, human_player,
+                    f"{end}  Press any key …"
+                )
                 stdscr.getch(); game_over = True
             else:
                 msg = f"AI played ({row},{col})  eval {val:+.2f}"
@@ -168,8 +178,25 @@ def play_game_curses(stdscr, ai, game):
     return True
 
 
-def main(stdscr, use_latest=False):
-    wf, label = select_weights(use_latest)
+def main(stdscr, use_latest=False, weight_file=None):
+    if weight_file:
+        wf = os.path.expanduser(weight_file)
+        label = "explicit"
+        if not wf.endswith(".h5"):
+            stdscr.clear()
+            stdscr.addstr(0, 0, "Invalid --weight_file: expected a .h5 file.")
+            stdscr.addstr(1, 0, f"  Got: {weight_file}")
+            stdscr.addstr(2, 0, "Press any key to exit …")
+            stdscr.refresh(); stdscr.getch(); return
+        if not os.path.isfile(wf):
+            stdscr.clear()
+            stdscr.addstr(0, 0, "Specified --weight_file does not exist.")
+            stdscr.addstr(1, 0, f"  Path: {wf}")
+            stdscr.addstr(2, 0, "Press any key to exit …")
+            stdscr.refresh(); stdscr.getch(); return
+    else:
+        wf, label = select_weights(use_latest)
+
     if not wf:
         stdscr.clear()
         stdscr.addstr(0, 0, "No weights found in weights/ — run train.py first.")
@@ -211,7 +238,10 @@ def main(stdscr, use_latest=False):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Play Gomoku against the AI")
-    parser.add_argument("--latest", action="store_true",
-                        help="Use latest training weights instead of best checkpoint")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--latest", action="store_true",
+                       help="Use latest training weights instead of best checkpoint")
+    group.add_argument("--weight_file", type=str, default=None,
+                       help="Path to a specific .h5 weights file to load")
     args = parser.parse_args()
-    curses.wrapper(main, use_latest=args.latest)
+    curses.wrapper(main, use_latest=args.latest, weight_file=args.weight_file)

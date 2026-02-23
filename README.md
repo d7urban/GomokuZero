@@ -74,6 +74,12 @@ Play against the trained AI:
 
 ```bash
 python play.py
+
+# Use latest training weights
+python play.py --latest
+
+# Use a specific .h5 weights file
+python play.py --weight_file weights/gomoku_20260223_001932_g00208.weights.h5
 ```
 
 Use arrow keys to move cursor, Enter to place stone. The AI uses MCTS with the trained network for move selection.
