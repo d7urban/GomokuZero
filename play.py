@@ -22,14 +22,20 @@ from gomoku import (
 # How hard the AI thinks (increase for stronger but slower play)
 AI_SIMULATIONS = 400
 AI_MCTS_BATCH  = 8      # small batch = better search quality
+DIFFICULTY_SIMS = {
+    "easy": 100,
+    "medium": 400,
+    "hard": 1600,
+}
 
 
 class AIPlayer:
     """AI that selects moves via MCTS backed by a trained network."""
 
-    def __init__(self, predict_fn, simulations=AI_SIMULATIONS):
+    def __init__(self, predict_fn, simulations=AI_SIMULATIONS, difficulty="medium"):
         self.predict_fn = predict_fn
         self.sims = simulations
+        self.difficulty = difficulty
 
     def get_move(self, game):
         root = mcts_search_batched(
@@ -156,7 +162,7 @@ def play_game_curses(stdscr, ai, game):
                 else:
                     human_turn = False
         else:
-            msg = f"AI thinking ({ai.sims} sims) …"
+            msg = f"AI thinking ({ai.difficulty}, {ai.sims} sims) …"
             draw_board(stdscr, game, cr, cc, human_player, msg)
             row, col, val = ai.get_move(game)
             assert game.board[row, col] == 0, (
@@ -178,7 +184,7 @@ def play_game_curses(stdscr, ai, game):
     return True
 
 
-def main(stdscr, use_latest=False, weight_file=None):
+def main(stdscr, use_latest=False, weight_file=None, difficulty="medium"):
     if weight_file:
         wf = os.path.expanduser(weight_file)
         label = "explicit"
@@ -213,9 +219,11 @@ def main(stdscr, use_latest=False, weight_file=None):
     predict_fn = make_predict_fn(model)
     # Warmup compiled graph
     predict_fn(np.zeros((1, BOARD_SIZE, BOARD_SIZE, NUM_INPUT_PLANES), dtype=np.float32))
-    ai = AIPlayer(predict_fn)
+    sims = DIFFICULTY_SIMS[difficulty]
+    ai = AIPlayer(predict_fn, simulations=sims, difficulty=difficulty)
+    stdscr.addstr(2, 0, f"  Difficulty: {difficulty} ({sims} sims)")
 
-    stdscr.addstr(2, 0, "  Ready!  Press any key to start …")
+    stdscr.addstr(3, 0, "  Ready!  Press any key to start …")
     stdscr.refresh(); stdscr.getch()
 
     while True:
@@ -243,5 +251,13 @@ if __name__ == "__main__":
                        help="Use latest training weights instead of best checkpoint")
     group.add_argument("--weight_file", type=str, default=None,
                        help="Path to a specific .h5 weights file to load")
+    parser.add_argument("--difficulty", choices=tuple(DIFFICULTY_SIMS.keys()),
+                        default="medium",
+                        help="AI difficulty tier: easy=100, medium=400, hard=1600 sims")
     args = parser.parse_args()
-    curses.wrapper(main, use_latest=args.latest, weight_file=args.weight_file)
+    curses.wrapper(
+        main,
+        use_latest=args.latest,
+        weight_file=args.weight_file,
+        difficulty=args.difficulty,
+    )

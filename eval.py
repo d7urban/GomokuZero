@@ -4,7 +4,7 @@ Gomoku — Evaluate checkpoints against older baselines.
 
 Runs deterministic matches (no noise, temperature=0) between two
 checkpoints on GPU and reports win rates, per-color stats, average game
-length, and Elo delta.
+length, and Glicko-2 rating delta.
 
 Usage:
     # Auto-detect latest checkpoint, eval vs t-1 and t-5:
@@ -15,12 +15,17 @@ Usage:
 
     # Custom opening count:
     python eval.py --openings 200
+
+    # Calibrate sim tiers on one checkpoint:
+    python eval.py --checkpoint weights/gomoku_best.weights.h5 \
+        --calibrate-sims --sim-levels 100,400,1600
 """
 
 import argparse
 import glob
 import math
 import os
+import pickle
 import re
 import time
 
@@ -47,6 +52,23 @@ EVAL_OPENING_SEED  = 42    # fixed seed — same openings across all evals
 
 # ── Opening book generation ─────────────────────────────────────────────────
 OPENING_BOOK_FILE = "weights/eval_openings.pkl"
+GLICKO2_RATINGS_FILE = "weights/glicko2_ratings.pkl"
+
+
+def _parse_sim_levels(spec):
+    """Parse comma-separated sim levels like '100,400,1600'."""
+    try:
+        vals = [int(x.strip()) for x in spec.split(",") if x.strip()]
+    except Exception as e:
+        raise ValueError(f"invalid sim list '{spec}': {e}") from e
+    if len(vals) < 2:
+        raise ValueError("need at least two sim levels")
+    if any(v <= 0 for v in vals):
+        raise ValueError("sim levels must be positive integers")
+    vals = sorted(set(vals))
+    if len(vals) < 2:
+        raise ValueError("need at least two distinct sim levels")
+    return vals
 
 def generate_openings(n_openings, n_plies=EVAL_OPENING_PLIES,
                       seed=EVAL_OPENING_SEED, max_center_gap=2.0):
@@ -209,20 +231,236 @@ def select_opponents(checkpoints, current_idx):
     return opponents
 
 
-# ── Elo calculation ─────────────────────────────────────────────────────────
-def elo_delta(wins, losses, draws):
-    """Compute Elo delta from match results.
+# ── Glicko-2 rating calculation ────────────────────────────────────────────
+GLICKO2_RATING0 = 1500.0
+GLICKO2_RD0 = 350.0
+GLICKO2_VOL0 = 0.06
+GLICKO2_TAU = 0.5
+GLICKO2_EPSILON = 1e-6
+GLICKO2_SCALE = 173.7178
 
-    Uses the standard formula: Elo_diff = 400 * log10(score / (1 - score))
-    where score = (wins + 0.5 * draws) / total.
-    Clamps to avoid ±infinity at 0% or 100%.
-    """
-    total = wins + losses + draws
-    if total == 0:
-        return 0.0
-    score = (wins + 0.5 * draws) / total
-    score = max(0.005, min(0.995, score))   # clamp
-    return 400.0 * math.log10(score / (1.0 - score))
+
+def _normalize_rating_key(checkpoint_path):
+    return os.path.normpath(checkpoint_path)
+
+
+def _new_glicko2_entry(checkpoint_path):
+    return {
+        "checkpoint_path": _normalize_rating_key(checkpoint_path),
+        "rating": float(GLICKO2_RATING0),
+        "rd": float(GLICKO2_RD0),
+        "vol": float(GLICKO2_VOL0),
+        "games": 0,
+        "periods": 0,
+        "updated_unix": int(time.time()),
+    }
+
+
+def load_glicko2_ratings(path=GLICKO2_RATINGS_FILE):
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                table = pickle.load(f)
+            if isinstance(table, dict):
+                return table
+        except Exception:
+            pass
+    return {}
+
+
+def save_glicko2_ratings(table, path=GLICKO2_RATINGS_FILE):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(table, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def get_glicko2_entry(table, checkpoint_path, create=True):
+    if not checkpoint_path:
+        return None
+    key = _normalize_rating_key(checkpoint_path)
+    entry = table.get(key)
+    if entry is None and create:
+        entry = _new_glicko2_entry(key)
+        table[key] = entry
+    return entry
+
+
+def format_glicko2_entry(entry):
+    if not entry:
+        return "unrated"
+    rating = float(entry.get("rating", GLICKO2_RATING0))
+    rd = float(entry.get("rd", GLICKO2_RD0))
+    vol = float(entry.get("vol", GLICKO2_VOL0))
+    return f"R {rating:.0f} ±{2.0 * rd:.0f} (RD {rd:.0f}, v {vol:.3f})"
+
+
+def _glicko2_to_internal(rating, rd):
+    return (rating - GLICKO2_RATING0) / GLICKO2_SCALE, rd / GLICKO2_SCALE
+
+
+def _glicko2_from_internal(mu, phi):
+    return GLICKO2_SCALE * mu + GLICKO2_RATING0, GLICKO2_SCALE * phi
+
+
+def _sigmoid(x):
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+
+def _glicko2_g(phi):
+    return 1.0 / math.sqrt(1.0 + (3.0 * phi * phi) / (math.pi * math.pi))
+
+
+def _glicko2_expectation(mu, mu_j, phi_j):
+    return _sigmoid(_glicko2_g(phi_j) * (mu - mu_j))
+
+
+def _glicko2_f(x, delta, phi, v, a, tau):
+    ex = math.exp(x)
+    num = ex * (delta * delta - phi * phi - v - ex)
+    den = 2.0 * (phi * phi + v + ex) ** 2
+    return (num / den) - ((x - a) / (tau * tau))
+
+
+def glicko2_update_player(rating, rd, vol, matches,
+                          tau=GLICKO2_TAU, epsilon=GLICKO2_EPSILON):
+    """Update one player from a list of (opp_rating, opp_rd, score)."""
+    if not matches:
+        return float(rating), float(rd), float(vol)
+
+    mu, phi = _glicko2_to_internal(rating, rd)
+    a = math.log(vol * vol)
+
+    v_inv = 0.0
+    delta_sum = 0.0
+    for opp_rating, opp_rd, score in matches:
+        mu_j, phi_j = _glicko2_to_internal(opp_rating, opp_rd)
+        g_phi_j = _glicko2_g(phi_j)
+        expected = _glicko2_expectation(mu, mu_j, phi_j)
+        v_inv += (g_phi_j * g_phi_j) * expected * (1.0 - expected)
+        delta_sum += g_phi_j * (score - expected)
+
+    if v_inv <= 0.0:
+        return float(rating), float(rd), float(vol)
+
+    v = 1.0 / v_inv
+    delta = v * delta_sum
+
+    A = a
+    if delta * delta > phi * phi + v:
+        B = math.log(delta * delta - phi * phi - v)
+    else:
+        k = 1
+        while _glicko2_f(a - k * tau, delta, phi, v, a, tau) < 0.0:
+            k += 1
+            if k > 1000:
+                break
+        B = a - k * tau
+
+    fA = _glicko2_f(A, delta, phi, v, a, tau)
+    fB = _glicko2_f(B, delta, phi, v, a, tau)
+    while abs(B - A) > epsilon:
+        denom = fB - fA
+        if abs(denom) < 1e-12:
+            C = 0.5 * (A + B)
+        else:
+            C = A + (A - B) * fA / denom
+        fC = _glicko2_f(C, delta, phi, v, a, tau)
+        if fC * fB < 0.0:
+            A = B
+            fA = fB
+        else:
+            fA /= 2.0
+        B = C
+        fB = fC
+
+    vol_prime = math.exp(A / 2.0)
+    phi_star = math.sqrt(phi * phi + vol_prime * vol_prime)
+    phi_prime = 1.0 / math.sqrt((1.0 / (phi_star * phi_star)) + (1.0 / v))
+    mu_prime = mu + (phi_prime * phi_prime) * delta_sum
+    rating_prime, rd_prime = _glicko2_from_internal(mu_prime, phi_prime)
+    return float(rating_prime), float(rd_prime), float(vol_prime)
+
+
+def glicko2_rating_delta(wins, losses, draws,
+                         rating=GLICKO2_RATING0, rd=GLICKO2_RD0,
+                         vol=GLICKO2_VOL0, opp_rating=GLICKO2_RATING0,
+                         opp_rd=GLICKO2_RD0, tau=GLICKO2_TAU,
+                         epsilon=GLICKO2_EPSILON):
+    """Compute candidate rating change for one match period via Glicko-2."""
+    outcomes = [1.0] * wins + [0.0] * losses + [0.5] * draws
+    matches = [(opp_rating, opp_rd, s) for s in outcomes]
+    rating_prime, _, _ = glicko2_update_player(
+        rating, rd, vol, matches, tau=tau, epsilon=epsilon
+    )
+    return rating_prime - rating
+
+
+def apply_match_glicko2_update(table, candidate_path, opponent_path,
+                               wins, losses, draws):
+    """Apply one match period update for both sides using stored ratings."""
+    if not candidate_path or not opponent_path:
+        return None
+    cand_key = _normalize_rating_key(candidate_path)
+    opp_key = _normalize_rating_key(opponent_path)
+    if cand_key == opp_key:
+        return None
+
+    cand = get_glicko2_entry(table, cand_key, create=True)
+    opp = get_glicko2_entry(table, opp_key, create=True)
+    if cand is None or opp is None:
+        return None
+
+    total = int(wins + losses + draws)
+    if total <= 0:
+        return None
+
+    cand_matches = (
+        [(opp["rating"], opp["rd"], 1.0)] * int(wins) +
+        [(opp["rating"], opp["rd"], 0.0)] * int(losses) +
+        [(opp["rating"], opp["rd"], 0.5)] * int(draws)
+    )
+    opp_matches = (
+        [(cand["rating"], cand["rd"], 0.0)] * int(wins) +
+        [(cand["rating"], cand["rd"], 1.0)] * int(losses) +
+        [(cand["rating"], cand["rd"], 0.5)] * int(draws)
+    )
+
+    cand_old = (cand["rating"], cand["rd"], cand["vol"])
+    opp_old = (opp["rating"], opp["rd"], opp["vol"])
+    cand_new = glicko2_update_player(*cand_old, cand_matches)
+    opp_new = glicko2_update_player(*opp_old, opp_matches)
+
+    now = int(time.time())
+    cand["rating"], cand["rd"], cand["vol"] = cand_new
+    cand["games"] = int(cand.get("games", 0)) + total
+    cand["periods"] = int(cand.get("periods", 0)) + 1
+    cand["updated_unix"] = now
+
+    opp["rating"], opp["rd"], opp["vol"] = opp_new
+    opp["games"] = int(opp.get("games", 0)) + total
+    opp["periods"] = int(opp.get("periods", 0)) + 1
+    opp["updated_unix"] = now
+
+    return {
+        "candidate": {
+            "key": cand_key,
+            "old": cand_old,
+            "new": cand_new,
+            "delta": cand_new[0] - cand_old[0],
+            "entry": cand,
+        },
+        "opponent": {
+            "key": opp_key,
+            "old": opp_old,
+            "new": opp_new,
+            "delta": opp_new[0] - opp_old[0],
+            "entry": opp,
+        },
+    }
 
 
 # ── Result tallying ────────────────────────────────────────────────────────
@@ -270,7 +508,7 @@ def _tally_results(results, label, elapsed):
                     white_quick_losses += 1
 
     total = wins + losses + draws
-    elo = elo_delta(wins, losses, draws)
+    g2_delta = glicko2_rating_delta(wins, losses, draws)
     avg_moves = float(np.mean(move_totals)) if move_totals else 0.0
     win_pct = 100.0 * wins / max(1, total)
 
@@ -286,7 +524,7 @@ def _tally_results(results, label, elapsed):
     print(f"  vs {label}:  "
           f"{wins}W {losses}L {draws}D  "
           f"({win_pct:.1f}%)  "
-          f"Elo Δ{elo:+.0f}  "
+          f"Glicko-2 Δ{g2_delta:+.0f}  "
           f"Avg {avg_moves:.0f} moves  "
           f"[{elapsed:.0f}s]")
     print(f"    As Black: {wins_as_black}W {losses_as_black}L {draws_as_black}D "
@@ -302,7 +540,7 @@ def _tally_results(results, label, elapsed):
     return {
         "label": label,
         "wins": wins, "losses": losses, "draws": draws,
-        "win_pct": win_pct, "elo_delta": elo,
+        "win_pct": win_pct, "glicko2_delta": g2_delta,
         "avg_moves": avg_moves, "elapsed": elapsed,
         "black_win_pct": black_pct, "white_win_pct": white_pct,
         "black_wins": wins_as_black, "black_losses": losses_as_black,
@@ -317,7 +555,7 @@ def _tally_results(results, label, elapsed):
 
 # ── Sequential match runner (GPU) ──────────────────────────────────────────
 def _play_eval_game_seq(candidate_fn, opponent_fn, candidate_color,
-                        sims, batch_size, opening):
+                        sims, batch_size, opening, opp_sims=None):
     """Play one deterministic eval game using compiled predict functions."""
     game = GomokuGame()
 
@@ -333,12 +571,14 @@ def _play_eval_game_seq(candidate_fn, opponent_fn, candidate_color,
     while not done:
         if game.current_player == candidate_color:
             fn = candidate_fn
+            move_sims = sims
         else:
             fn = opponent_fn
+            move_sims = opp_sims if opp_sims is not None else sims
 
         root = mcts_search_batched(
             game, fn,
-            num_simulations=sims,
+            num_simulations=move_sims,
             batch_size=batch_size,
             c_puct=1.5,
             add_noise=False,
@@ -372,12 +612,15 @@ def _play_eval_game_seq(candidate_fn, opponent_fn, candidate_color,
 
 
 def run_match_sequential(candidate_model, opponent_model, label, openings,
-                         sims=EVAL_SIMS, batch_size=8):
+                         sims=EVAL_SIMS, batch_size=8, opp_sims=None):
     """Run a full evaluation match sequentially on GPU.
 
     Takes pre-loaded model objects (no file I/O, no multiprocessing).
     Each opening is played twice (color swap).  Deterministic play.
     Compiles models via @tf.function for faster inference.
+
+    sims: MCTS sims for candidate side.
+    opp_sims: if set, uses a different MCTS sims budget for opponent side.
     """
     # Compile both models once (no-op if already compiled)
     cand_fn = make_predict_fn(candidate_model)
@@ -398,7 +641,7 @@ def run_match_sequential(candidate_model, opponent_model, label, openings,
     for i, (cand_color, opening) in enumerate(games, 1):
         res = _play_eval_game_seq(
             cand_fn, opp_fn, cand_color,
-            sims, batch_size, opening,
+            sims, batch_size, opening, opp_sims=opp_sims,
         )
         results.append(res)
         print(f"  Eval vs {label}: {i}/{n_games} games", end="\r", flush=True)
@@ -428,6 +671,14 @@ def main():
                         help=f"Random plies per opening (default: {EVAL_OPENING_PLIES})")
     parser.add_argument("--weights-dir", type=str, default="weights",
                         help="Directory containing checkpoints")
+    parser.add_argument("--calibrate-sims", action="store_true",
+                        help="Calibrate strength gaps between sim budgets "
+                             "on one checkpoint")
+    parser.add_argument("--sim-levels", type=str, default="100,400,1600",
+                        help="Comma-separated sims for calibration mode "
+                             "(default: 100,400,1600)")
+    parser.add_argument("--no-rating-update", action="store_true",
+                        help="Do not update persistent Glicko-2 ratings")
     args = parser.parse_args()
 
     checkpoints = find_checkpoints(args.weights_dir)
@@ -439,6 +690,7 @@ def main():
           f"(g{checkpoints[0][0]:05d} – g{checkpoints[-1][0]:05d})")
 
     # Determine candidate
+    candidate_key = None
     if args.checkpoint:
         candidate_path = args.checkpoint
         candidate_idx = None
@@ -468,27 +720,30 @@ def main():
                         break
                 if candidate_idx is not None:
                     print(f"Candidate: {candidate_path} (best @ g{resolved_gc:05d})")
+                    candidate_key = checkpoints[candidate_idx][1]
                 else:
                     candidate_idx = len(checkpoints) - 1
                     print(f"Candidate: {candidate_path} "
                           f"(best @ g{resolved_gc:05d}, using latest for opponents)")
+                    candidate_key = os.path.normpath(candidate_path)
             else:
                 candidate_idx = len(checkpoints) - 1
                 print(f"Candidate: {candidate_path} (using latest for opponent selection)")
+                candidate_key = os.path.normpath(candidate_path)
         else:
             candidate_gc = checkpoints[candidate_idx][0]
             print(f"Candidate: g{candidate_gc:05d}  ({candidate_path})")
+            candidate_key = checkpoints[candidate_idx][1]
     else:
         candidate_idx = len(checkpoints) - 1
         candidate_path = checkpoints[candidate_idx][1]
         candidate_gc = checkpoints[candidate_idx][0]
         print(f"Candidate: g{candidate_gc:05d}  ({candidate_path})")
+        candidate_key = checkpoints[candidate_idx][1]
 
-    opponents = select_opponents(checkpoints, candidate_idx)
     candidate_gc = checkpoints[candidate_idx][0]
-    if not opponents:
-        print("Not enough checkpoints for comparison yet.")
-        return
+    if candidate_key is None:
+        candidate_key = checkpoints[candidate_idx][1]
 
     # Load or create fixed opening book (same for all matchups and runs)
     openings = load_or_create_openings(args.openings, n_plies=args.plies,
@@ -504,17 +759,72 @@ def main():
     else:
         print("No GPU detected — eval will be slow.")
 
-    print(f"Opponents: {', '.join(lbl for lbl, _ in opponents)}")
-    print(f"Openings: {len(openings)} positions × 2 colors = {n_games} games")
-    print(f"MCTS: {args.sims} sims, deterministic (no noise, temp=0)")
-    print()
-
     # Load candidate model once (reused for all matchups)
     candidate_model = create_model()
     candidate_model.load_weights(candidate_path)
 
+    if args.calibrate_sims:
+        try:
+            sim_levels = _parse_sim_levels(args.sim_levels)
+        except ValueError as e:
+            parser.error(str(e))
+
+        print("Mode: sims calibration (single checkpoint, deterministic)")
+        print("Rating updates: disabled in calibration mode")
+        print(f"Sims levels: {', '.join(str(v) for v in sim_levels)}")
+        print(f"Openings: {len(openings)} positions × 2 colors = {n_games} games per matchup")
+        print()
+
+        cal_rows = []
+        g2_by_pair = {}
+        for i in range(len(sim_levels)):
+            for j in range(i + 1, len(sim_levels)):
+                low = sim_levels[i]
+                high = sim_levels[j]
+                label = f"{high} sims vs {low} sims"
+                result = run_match_sequential(
+                    candidate_model, candidate_model, label,
+                    openings=openings,
+                    sims=high,
+                    opp_sims=low,
+                    batch_size=EVAL_BATCH_SIZE,
+                )
+                cal_rows.append((high, low, result))
+                g2_by_pair[(low, high)] = result["glicko2_delta"]
+                print()
+
+        print("=" * 60)
+        print(f"Sims calibration summary for g{candidate_gc:05d}")
+        print("=" * 60)
+        for high, low, r in cal_rows:
+            print(f"  {high:4d} vs {low:4d} sims  "
+                  f"{r['win_pct']:5.1f}%  Glicko-2 Δ{r['glicko2_delta']:+4.0f}")
+
+        if len(sim_levels) >= 3:
+            print("\nAdjacent tier gaps:")
+            for low, high in zip(sim_levels[:-1], sim_levels[1:]):
+                g2 = g2_by_pair.get((low, high))
+                if g2 is None:
+                    continue
+                print(f"  {low:4d} → {high:4d}: Glicko-2 Δ{g2:+.0f}")
+        return
+
+    opponents = select_opponents(checkpoints, candidate_idx)
+    if not opponents:
+        print("Not enough checkpoints for comparison yet.")
+        return
+
+    print(f"Opponents: {', '.join(lbl for lbl, _ in opponents)}")
+    print(f"Openings: {len(openings)} positions × 2 colors = {n_games} games")
+    print(f"MCTS: {args.sims} sims, deterministic (no noise, temp=0)")
+    print(f"Ratings: {'off' if args.no_rating_update else 'on'} "
+          f"({GLICKO2_RATINGS_FILE})")
+    print()
+
     # Reusable opponent model (swap weights per matchup)
     opp_model = create_model()
+    ratings_table = load_glicko2_ratings()
+    ratings_changed = False
 
     all_results = []
     for label, opp_path in opponents:
@@ -525,8 +835,31 @@ def main():
             sims=args.sims,
             batch_size=EVAL_BATCH_SIZE,
         )
+        if not args.no_rating_update:
+            upd = apply_match_glicko2_update(
+                ratings_table,
+                candidate_key,
+                opp_path,
+                wins=result["wins"],
+                losses=result["losses"],
+                draws=result["draws"],
+            )
+            if upd:
+                ratings_changed = True
+                cand_entry = upd["candidate"]["entry"]
+                opp_entry = upd["opponent"]["entry"]
+                print(f"    Rating update: cand {format_glicko2_entry(cand_entry)}  "
+                      f"|  opp {format_glicko2_entry(opp_entry)}")
         all_results.append(result)
         print()
+
+    if ratings_changed:
+        save_glicko2_ratings(ratings_table)
+        cand_entry = get_glicko2_entry(ratings_table, candidate_key, create=False)
+        if cand_entry:
+            print(f"Saved ratings → {GLICKO2_RATINGS_FILE}  "
+                  f"(candidate now {format_glicko2_entry(cand_entry)})")
+            print()
 
     # Summary
     print("=" * 60)
@@ -537,7 +870,7 @@ def main():
                  "✗ REGRESSED" if r["win_pct"] < 45 else \
                  "~ STABLE"
         print(f"  vs {r['label']:20s}  {r['win_pct']:5.1f}%  "
-              f"Elo Δ{r['elo_delta']:+4.0f}  "
+              f"Glicko-2 Δ{r['glicko2_delta']:+4.0f}  "
               f"{status}")
 
     # Quick verdict

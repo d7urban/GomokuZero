@@ -66,7 +66,15 @@ python eval.py --checkpoint weights/gomoku_best.weights.h5
 
 # Custom opening count
 python eval.py --openings 200
+
+# Calibrate strength between sim tiers on one checkpoint
+python eval.py --checkpoint weights/gomoku_best.weights.h5 --calibrate-sims --sim-levels 100,400,1600
+
+# Run eval without changing persistent ratings
+python eval.py --no-rating-update
 ```
+
+Standard eval runs update persistent Glicko-2 ratings in `weights/glicko2_ratings.pkl`.
 
 ### Playing
 
@@ -74,6 +82,11 @@ Play against the trained AI:
 
 ```bash
 python play.py
+
+# Pick a difficulty tier
+python play.py --difficulty easy    # 100 sims
+python play.py --difficulty medium  # 400 sims (default)
+python play.py --difficulty hard    # 1600 sims
 
 # Use latest training weights
 python play.py --latest

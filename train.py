@@ -38,7 +38,9 @@ from gomoku import (
 
 from eval import (
     load_or_create_openings, find_checkpoints,
-    run_match_sequential, elo_delta,
+    run_match_sequential,
+    load_glicko2_ratings, save_glicko2_ratings,
+    get_glicko2_entry, apply_match_glicko2_update, format_glicko2_entry,
 )
 
 # ── Tunables ────────────────────────────────────────────────────────────────
@@ -839,13 +841,23 @@ BEST_WEIGHTS_FILE = "weights/gomoku_best.weights.h5"
 BEST_STATE_FILE   = "weights/best_checkpoint.pkl"
 
 def _load_best_state():
+    default = {"path": None, "game_count": 0, "glicko2_vs_long": None}
     if os.path.exists(BEST_STATE_FILE):
         try:
             with open(BEST_STATE_FILE, "rb") as f:
-                return pickle.load(f)
+                state = pickle.load(f)
+            if isinstance(state, dict):
+                # Backward compatibility with older saved key name.
+                if "glicko2_vs_long" not in state:
+                    state["glicko2_vs_long"] = state.get("elo_vs_long")
+                return {
+                    "path": state.get("path"),
+                    "game_count": int(state.get("game_count", 0) or 0),
+                    "glicko2_vs_long": state.get("glicko2_vs_long"),
+                }
         except Exception:
             pass
-    return {"path": None, "game_count": 0, "elo_vs_long": None}
+    return default
 
 
 def _save_best_state(state):
@@ -934,7 +946,8 @@ def _sample_eval_openings(all_openings, n_openings, seed):
     return [all_openings[i] for i in idxs]
 
 
-def _run_promotion_eval(model, game_count, all_openings, best_state, opp_model):
+def _run_promotion_eval(model, game_count, all_openings, best_state, opp_model,
+                        glicko2_table=None):
     """Promotion eval vs current best checkpoint — promotes if both colors improved.
 
     Triggered by rolling diagnostic signal (2 strong checks out of latest 3).
@@ -949,13 +962,17 @@ def _run_promotion_eval(model, game_count, all_openings, best_state, opp_model):
     best_gc = best_state.get("game_count", 0)
 
     # Reuse a checkpoint at this game count if one exists (e.g. save+eval
-    # coincide); otherwise only write a new checkpoint when promotion succeeds.
+    # coincide). If we need to rate this match and no checkpoint exists yet,
+    # save one so ratings remain tied to concrete weight files.
     checkpoints = find_checkpoints()
     cp_file = None
     for gc, fp in reversed(checkpoints):
         if abs(gc - game_count) <= 10:
             cp_file = fp
             break
+    if glicko2_table is not None and cp_file is None:
+        cp_file = _save_timestamped_checkpoint(model, game_count)
+        print(f"  ↳ Saved checkpoint for Glicko-2 tracking: {cp_file}", flush=True)
 
     if not os.path.exists(BEST_WEIGHTS_FILE):
         # No best yet — auto-promote
@@ -965,8 +982,11 @@ def _run_promotion_eval(model, game_count, all_openings, best_state, opp_model):
         best_state = {
             "path": cp_file,
             "game_count": game_count,
-            "elo_vs_long": None,
+            "glicko2_vs_long": None,
         }
+        if glicko2_table is not None:
+            get_glicko2_entry(glicko2_table, cp_file, create=True)
+            save_glicko2_ratings(glicko2_table)
         _save_best_state(best_state)
         print(f"  ★ Auto-promoted to best (no previous best)", flush=True)
         return best_state
@@ -986,6 +1006,24 @@ def _run_promotion_eval(model, game_count, all_openings, best_state, opp_model):
         sims=PROMOTE_EVAL_SIMS,
         batch_size=MCTS_BATCH_SIZE,
     )
+
+    cand_rating_delta = None
+    if glicko2_table is not None and cp_file and best_state.get("path"):
+        upd = apply_match_glicko2_update(
+            glicko2_table,
+            cp_file,
+            best_state.get("path"),
+            wins=result["wins"],
+            losses=result["losses"],
+            draws=result["draws"],
+        )
+        if upd:
+            cand_entry = upd["candidate"]["entry"]
+            opp_entry = upd["opponent"]["entry"]
+            cand_rating_delta = upd["candidate"]["delta"]
+            print(f"  ↳ Rating update: cand {format_glicko2_entry(cand_entry)}  "
+                  f"|  best {format_glicko2_entry(opp_entry)}", flush=True)
+            save_glicko2_ratings(glicko2_table)
 
     z = 1.96 if PROMOTE_CI_LEVEL >= 0.95 else 1.645
 
@@ -1030,8 +1068,13 @@ def _run_promotion_eval(model, game_count, all_openings, best_state, opp_model):
         best_state = {
             "path": cp_file,
             "game_count": game_count,
-            "elo_vs_long": result["elo_delta"],
+            "glicko2_vs_long": result["glicko2_delta"],
         }
+        if glicko2_table is not None:
+            best_entry = get_glicko2_entry(
+                glicko2_table, best_state["path"], create=False)
+            if best_entry is not None:
+                best_state["glicko2_vs_long"] = best_entry.get("rating")
         _save_best_state(best_state)
         white_reason = (
             f"W non-loss={100.0 * white_non_loss_rate:.0f}% "
@@ -1041,7 +1084,8 @@ def _run_promotion_eval(model, game_count, all_openings, best_state, opp_model):
         print(f"  ★ Promoted to best "
               f"(B lower={black_lower:.0%}>{PROMOTE_BLACK_LOWER:.0%}, "
               f"{white_reason}, "
-              f"Elo Δ{result['elo_delta']:+.0f})", flush=True)
+              f"Glicko-2 Δ{(cand_rating_delta if cand_rating_delta is not None else result['glicko2_delta']):+.0f})",
+              flush=True)
     else:
         reasons = []
         if not black_ok:
@@ -1067,6 +1111,11 @@ def _run_promotion_eval(model, game_count, all_openings, best_state, opp_model):
                 )
         print(f"  (best remains g{best_gc:05d} — {', '.join(reasons)})",
               flush=True)
+        if glicko2_table is not None and best_state.get("path"):
+            best_entry = get_glicko2_entry(
+                glicko2_table, best_state["path"], create=False)
+            if best_entry is not None:
+                best_state["glicko2_vs_long"] = best_entry.get("rating")
 
     return best_state
 
@@ -1190,10 +1239,12 @@ def main():
         print("Book openings: not available (book_openings.py missing)")
 
     best_state = _load_best_state()
+    glicko2_table = load_glicko2_ratings()
     if best_state["path"]:
-        elo_str = (f"Elo Δ{best_state['elo_vs_long']:+.0f}"
-                   if best_state["elo_vs_long"] is not None else "no Elo")
-        print(f"Current best: g{best_state['game_count']:05d} ({elo_str})")
+        best_entry = get_glicko2_entry(
+            glicko2_table, best_state.get("path"), create=False)
+        rating_str = format_glicko2_entry(best_entry) if best_entry else "unrated"
+        print(f"Current best: g{best_state['game_count']:05d} ({rating_str})")
     else:
         print("No best checkpoint yet — first promotion after initial evals.")
 
@@ -1393,6 +1444,7 @@ def main():
             if curr_save_tick > prev_save_tick:
                 cp_file = _save_timestamped_checkpoint(model, game_count)
                 model.save_weights(weights_file)
+                save_glicko2_ratings(glicko2_table)
                 _save_training_state(
                     game_count, optimizer, replay, lr_scheduler,
                     eval_state={
@@ -1408,8 +1460,10 @@ def main():
                     best_state = {
                         "path": cp_file,
                         "game_count": game_count,
-                        "elo_vs_long": None,
+                        "glicko2_vs_long": None,
                     }
+                    get_glicko2_entry(glicko2_table, cp_file, create=True)
+                    save_glicko2_ratings(glicko2_table)
                     _save_best_state(best_state)
                     if best_model is None:
                         best_model = create_model()
@@ -1526,7 +1580,8 @@ def main():
                         old_best_gc = best_state.get("game_count", 0)
                         best_state = _run_promotion_eval(
                             model, game_count, full_openings,
-                            best_state, opp_model)
+                            best_state, opp_model,
+                            glicko2_table=glicko2_table)
                         promotion_pending = False
                         diag_strong_history.clear()
 
@@ -1551,6 +1606,7 @@ def main():
     tag = "interrupted" if interrupted else "final"
     model.save_weights(f"weights/gomoku_{ts}_{tag}.weights.h5")
     model.save_weights(weights_file)
+    save_glicko2_ratings(glicko2_table)
 
     _save_training_state(
         game_count, optimizer, replay, lr_scheduler,
@@ -1566,10 +1622,11 @@ def main():
         print(f"\n✓ Training complete — {game_count} games.  Weights → {weights_file}")
 
     if best_state.get("path"):
-        elo_str = (f"Elo Δ{best_state['elo_vs_long']:+.0f}"
-                   if best_state.get("elo_vs_long") is not None else "no Elo")
+        best_entry = get_glicko2_entry(
+            glicko2_table, best_state.get("path"), create=False)
+        rating_str = format_glicko2_entry(best_entry) if best_entry else "unrated"
         print(f"  Best checkpoint: g{best_state['game_count']:05d} "
-              f"({elo_str})  → {BEST_WEIGHTS_FILE}")
+              f"({rating_str})  → {BEST_WEIGHTS_FILE}")
 
     elapsed = time.time() - t_start
     h, m = divmod(int(elapsed), 3600)
