@@ -58,6 +58,22 @@ BEST_WEIGHTS  = "weights/gomoku_best.weights.h5"
 LATEST_WEIGHTS = "weights/gomoku_weights.weights.h5"
 
 
+def resolve_difficulty(value):
+    """Resolve a difficulty string to (label, simulations)."""
+    key = (value or "").strip().lower()
+    if key in DIFFICULTY_SIMS:
+        return key, DIFFICULTY_SIMS[key]
+    try:
+        sims = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Invalid --difficulty. Use easy|medium|hard or a positive integer sims count."
+        )
+    if sims <= 0:
+        raise ValueError("Custom --difficulty sims must be a positive integer.")
+    return "Custom", sims
+
+
 def select_weights(use_latest=False):
     """Return weights path.  Prefers best; falls back to latest."""
     if use_latest:
@@ -219,9 +235,16 @@ def main(stdscr, use_latest=False, weight_file=None, difficulty="medium"):
     predict_fn = make_predict_fn(model)
     # Warmup compiled graph
     predict_fn(np.zeros((1, BOARD_SIZE, BOARD_SIZE, NUM_INPUT_PLANES), dtype=np.float32))
-    sims = DIFFICULTY_SIMS[difficulty]
-    ai = AIPlayer(predict_fn, simulations=sims, difficulty=difficulty)
-    stdscr.addstr(2, 0, f"  Difficulty: {difficulty} ({sims} sims)")
+    try:
+        difficulty_label, sims = resolve_difficulty(difficulty)
+    except ValueError as e:
+        stdscr.clear()
+        stdscr.addstr(0, 0, str(e))
+        stdscr.addstr(1, 0, f"  Got: {difficulty}")
+        stdscr.addstr(2, 0, "Press any key to exit …")
+        stdscr.refresh(); stdscr.getch(); return
+    ai = AIPlayer(predict_fn, simulations=sims, difficulty=difficulty_label)
+    stdscr.addstr(2, 0, f"  Difficulty: {difficulty_label} ({sims} sims)")
 
     stdscr.addstr(3, 0, "  Ready!  Press any key to start …")
     stdscr.refresh(); stdscr.getch()
@@ -251,9 +274,12 @@ if __name__ == "__main__":
                        help="Use latest training weights instead of best checkpoint")
     group.add_argument("--weight_file", type=str, default=None,
                        help="Path to a specific .h5 weights file to load")
-    parser.add_argument("--difficulty", choices=tuple(DIFFICULTY_SIMS.keys()),
-                        default="medium",
-                        help="AI difficulty tier: easy=100, medium=400, hard=1600 sims")
+    parser.add_argument(
+        "--difficulty",
+        type=str,
+        default="medium",
+        help="AI difficulty: easy|medium|hard, or a positive integer sims count (e.g. 2500)",
+    )
     args = parser.parse_args()
     curses.wrapper(
         main,

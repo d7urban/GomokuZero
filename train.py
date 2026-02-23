@@ -107,7 +107,8 @@ RESIGN_MIN_MOVES     = 30       # don't check before this many moves
 # 1. Diagnostic: lightweight check every EVAL_INTERVAL.
 #    Uses t-1 when evaluating a freshly saved checkpoint, otherwise compares
 #    current in-memory weights vs the latest saved checkpoint.
-#    Tracks a robust rolling signal (2 strong checks out of latest 3).
+#    Tracks a rolling signal (2 strong checks in latest up-to-3 checks),
+#    arming as soon as the second strong check appears.
 # 2. Promotion: eval vs current best when diagnostic signal is strong.
 INLINE_EVAL_OPENINGS  = 30       # 30 openings × 2 colors = 60 games (diagnostic)
 PROMOTE_EVAL_OPENINGS = 60       # 60 openings × 2 colors = 120 games (promotion)
@@ -1192,8 +1193,9 @@ def main():
         print("Threat planes: numpy fallback (~150μs, rebuild Cython or pip install numba)")
     print(f"Checkpoints: save every {SAVE_INTERVAL}g")
     print(f"Eval: diagnostic every {EVAL_INTERVAL}g ({DIAG_EVAL_SIMS} sims), "
-          f"promotion trigger: {PROMOTE_DIAG_MIN_STRONG}/{PROMOTE_DIAG_WINDOW} "
-          f"diag checks with Black lower>{PROMOTE_DIAG_BLACK_LOWER:.0%} "
+          f"promotion trigger: {PROMOTE_DIAG_MIN_STRONG} strong checks in rolling "
+          f"{PROMOTE_DIAG_WINDOW} (arm immediately) with "
+          f"Black lower>{PROMOTE_DIAG_BLACK_LOWER:.0%} "
           f"({PROMOTE_EVAL_SIMS} sims, per-color Wilson CI)")
     print(f"Concurrent games: {CONCURRENT_GAMES}, target: {NUM_GAMES}")
     print(f"Best-opponent: {BEST_PLAY_FRAC:.0%} of games vs best checkpoint")
@@ -1557,8 +1559,9 @@ def main():
                     emerg_lr_fired = False
                     consec_mild_regress = 0
 
-                # Promotion trigger: >=2 strong diagnostics in latest 3 checks.
-                if (len(diag_strong_history) == PROMOTE_DIAG_WINDOW
+                # Promotion trigger: arm as soon as rolling window contains
+                # enough strong diagnostics (no need to wait for full window).
+                if (len(diag_strong_history) >= PROMOTE_DIAG_MIN_STRONG
                         and sum(diag_strong_history) >= PROMOTE_DIAG_MIN_STRONG):
                     if not promotion_pending:
                         print("  → Promotion trigger armed (rolling diagnostics)",
