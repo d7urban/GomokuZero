@@ -7,7 +7,7 @@ AlphaZero-style Gomoku (Five In A Row) engine using deep reinforcement learning 
 - **AlphaZero architecture**: Combines deep neural networks with MCTS for superhuman play
 - **Batched MCTS**: Virtual-loss parallel tree search with GPU-accelerated batch evaluation
 - **Cython acceleration**: Optional C-level speedups for critical MCTS paths
-- **Numba JIT**: Accelerated threat detection planes
+- **Threat-plane backend fallback**: Cython (`mcts_accel`) -> Numba JIT -> NumPy fallback
 - **Self-play training**: Generates training data through competitive self-play
 - **Inline evaluation**: Automatic checkpoint comparison during training
 - **Interactive play**: Terminal-based UI to play against the trained AI
@@ -17,8 +17,8 @@ AlphaZero-style Gomoku (Five In A Row) engine using deep reinforcement learning 
 - Python 3.8+
 - TensorFlow 2.x (GPU recommended)
 - NumPy
-- Cython (optional, for acceleration)
-- Numba (optional, for threat detection speedup)
+- Cython (optional, preferred for acceleration)
+- Numba (optional fallback for threat planes when Cython is unavailable)
 
 ## Installation
 
@@ -88,6 +88,9 @@ python play.py --difficulty easy    # 100 sims
 python play.py --difficulty medium  # 400 sims (default)
 python play.py --difficulty hard    # 1600 sims
 
+# Or set a custom sim count directly
+python play.py --difficulty 2500    # custom sims ("Custom" in UI)
+
 # Use latest training weights
 python play.py --latest
 
@@ -95,7 +98,9 @@ python play.py --latest
 python play.py --weight_file weights/gomoku_20260223_001932_g00208.weights.h5
 ```
 
-Use arrow keys to move cursor, Enter to place stone. The AI uses MCTS with the trained network for move selection.
+Use arrow keys to move cursor, Enter to place stone. `--difficulty` accepts
+`easy|medium|hard` or any positive integer simulation count. The AI uses MCTS
+with the trained network for move selection.
 
 ## Architecture
 
@@ -117,8 +122,8 @@ Use arrow keys to move cursor, Enter to place stone. The AI uses MCTS with the t
 
 ## Performance
 
-The Cython acceleration provides significant speedups for MCTS operations. Without it, pure Python MCTS is still functional but slower. GPU acceleration via TensorFlow is highly recommended for training and strong play.
+Backend order for threat planes is Cython -> Numba -> NumPy. Typical 15x15 timing is ~3us for Cython/Numba and ~150us for NumPy fallback. Cython also accelerates key MCTS paths. GPU acceleration via TensorFlow is highly recommended for training and strong play.
 
 ## License
 
-MIT (or specify your license)
+GNU General Public License v3.0 (GPLv3). See `LICENSE`.
