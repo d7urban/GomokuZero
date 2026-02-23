@@ -10,7 +10,7 @@ AlphaZero-style Gomoku (Five In A Row) engine using deep reinforcement learning 
 - **Threat-plane backend fallback**: Cython (`mcts_accel`) -> Numba JIT -> NumPy fallback
 - **Self-play training**: Generates training data through competitive self-play
 - **Inline evaluation**: Automatic checkpoint comparison during training
-- **Interactive play**: Terminal-based UI to play against the trained AI
+- **Interactive play**: Terminal UI (`play.py`) and Qt GUI (`play_qt.py`)
 
 ## Requirements
 
@@ -19,6 +19,7 @@ AlphaZero-style Gomoku (Five In A Row) engine using deep reinforcement learning 
 - NumPy
 - Cython (optional, preferred for acceleration)
 - Numba (optional fallback for threat planes when Cython is unavailable)
+- PyQt6 (optional, for graphical play via `play_qt.py`)
 
 ## Installation
 
@@ -31,7 +32,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # Install dependencies
-pip install tensorflow numpy cython numba
+pip install tensorflow numpy cython numba pyqt6
 
 # Build Cython acceleration (optional but recommended)
 python setup_accel.py build_ext --inplace
@@ -102,6 +103,21 @@ Use arrow keys to move cursor, Enter to place stone. `--difficulty` accepts
 `easy|medium|hard` or any positive integer simulation count. The AI uses MCTS
 with the trained network for move selection.
 
+### Qt GUI (play_qt.py)
+
+Play with a graphical board UI:
+
+```bash
+python play_qt.py
+```
+
+`play_qt.py` supports:
+- Human vs AI and Human vs Human modes
+- Auto-load of the current best checkpoint on startup (with fallback to latest/checkpoint)
+- Difficulty tiers and custom simulation counts
+- Analysis heatmap mode: continuous MCTS pondering on the human turn, with
+  per-move shading and policy tooltips on empty intersections
+
 ## Architecture
 
 - **Board**: 15×15 grid, standard Gomoku rules (5 in a row wins)
@@ -116,6 +132,7 @@ with the trained network for move selection.
 - `train.py` - Self-play training loop with inline evaluation
 - `eval.py` - Checkpoint evaluation and ELO calculation
 - `play.py` - Interactive terminal UI for human vs AI
+- `play_qt.py` - PyQt6 graphical UI (human vs AI / human vs human, analysis heatmap)
 - `book_openings.py` - Opening book for evaluation consistency
 - `mcts_accel.pyx` - Cython-accelerated MCTS functions
 - `setup_accel.py` - Build script for Cython extensions
