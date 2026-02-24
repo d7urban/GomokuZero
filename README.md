@@ -71,6 +71,9 @@ python eval.py --openings 200
 # Calibrate strength between sim tiers on one checkpoint
 python eval.py --checkpoint weights/gomoku_best.weights.h5 --calibrate-sims --sim-levels 100,400,1600
 
+# Run tournament across all weight files in a folder
+python eval.py --tournament-dir botb-weights
+
 # Run eval without changing persistent ratings
 python eval.py --no-rating-update
 ```
@@ -120,11 +123,28 @@ python play_qt.py
 
 ## Architecture
 
-- **Board**: 15×15 grid, standard Gomoku rules (5 in a row wins)
-- **Network**: Residual CNN with policy and value heads
-- **Input encoding**: 6 planes (2 stone planes + 4 threat planes)
-- **MCTS**: Batched search with virtual loss for parallelization
-- **Training**: Policy loss (cross-entropy) + value loss (MSE)
+- **Board / rules**: 15×15 Gomoku, 5 in a row wins.
+- **Input tensor**: `(15, 15, 6)` from the current player's perspective.
+  - Plane 0: current player's stones
+  - Plane 1: opponent stones
+  - Plane 2: current player's open-four threat cells
+  - Plane 3: opponent open-four threat cells
+  - Plane 4: current player's open-three threat cells
+  - Plane 5: opponent open-three threat cells
+- **Backbone**:
+  - 3×3 conv stem, 128 channels, BN, ReLU
+  - 6 residual blocks (each: 3×3 conv -> BN -> ReLU -> 3×3 conv -> BN -> skip add -> ReLU)
+  - Squeeze-and-Excitation on every other residual block (blocks 2, 4, 6)
+- **Policy head**:
+  - 1×1 conv (2 channels) -> BN -> ReLU -> Flatten -> Dense(225)
+  - Outputs raw logits for all board cells (no softmax in-model; masking/softmax is applied in MCTS/training)
+- **Value head**:
+  - 1×1 conv (1 channel) -> BN -> ReLU -> Flatten -> Dense(128, ReLU) -> Dense(1, tanh)
+  - Outputs expected game outcome in `[-1, 1]`
+- **Search**: Batched MCTS with virtual loss, candidate-move pruning, and GPU batched inference.
+- **Training targets**:
+  - Policy target: MCTS visit distribution
+  - Value target: final game outcome from the side-to-move perspective
 
 ## Files
 

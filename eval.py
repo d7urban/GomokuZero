@@ -19,6 +19,9 @@ Usage:
     # Calibrate sim tiers on one checkpoint:
     python eval.py --checkpoint weights/gomoku_best.weights.h5 \
         --calibrate-sims --sim-levels 100,400,1600
+
+    # Run a best-of-best tournament over all weights in a folder:
+    python eval.py --tournament-dir botb-weights
 """
 
 import argparse
@@ -48,6 +51,22 @@ EVAL_BATCH_SIZE   = 8      # MCTS batch size
 EVAL_GAMES        = 200    # games per matchup (100 openings × 2 color swaps)
 EVAL_OPENING_PLIES = 6     # random moves per opening position
 EVAL_OPENING_SEED  = 42    # fixed seed — same openings across all evals
+
+# Tournament defaults (best-of-best over multiple weight files)
+TOURNEY_RR_SIMS = 50
+TOURNEY_RR_OPENINGS = 8              # 16 games per pairing per round
+TOURNEY_RR_MAX_ROUNDS = 8
+TOURNEY_RR_CONTENDER_PROB = 0.90     # top-2 must beat all others at this p
+TOURNEY_RR_MIN_GAMES = 40
+
+# Heads-up final: strong sims for decision quality, then cheap 50-sim
+# squeeze batches to tighten RD if needed.
+TOURNEY_H2H_PHASES = ((200, 6), (400, 4), (50, 8))   # (sims, batches)
+TOURNEY_H2H_OPENINGS_PER_BATCH = 20          # 40 games per batch
+TOURNEY_H2H_CONFIDENCE_PROB = 0.975          # ~2 sigma winner confidence
+TOURNEY_H2H_MIN_GAMES = 120
+TOURNEY_H2H_RATING_PERIOD_GAMES = 200        # aggregate before Glicko update
+TOURNEY_H2H_TARGET_RD = 19.5                 # keep running until RD is below this
 
 
 # ── Opening book generation ─────────────────────────────────────────────────
@@ -204,6 +223,42 @@ def find_checkpoints(weights_dir="weights"):
             checkpoints.append((game_count, f))
     checkpoints.sort()
     return checkpoints
+
+
+def find_weight_files(weights_dir):
+    """Find model weight files in a directory for tournament mode.
+
+    Prefers .weights.h5 but also allows .h5/.keras for convenience.
+    Returns normalized absolute/relative paths sorted by filename.
+    """
+    patterns = ("*.weights.h5", "*.h5", "*.keras")
+    found = []
+    seen = set()
+    for pat in patterns:
+        for fp in glob.glob(os.path.join(weights_dir, pat)):
+            if not os.path.isfile(fp):
+                continue
+            key = os.path.normpath(fp)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(key)
+    found.sort(key=lambda p: (os.path.basename(p).lower(), p.lower()))
+    return found
+
+
+def _validate_weight_files_for_model(model, weight_paths):
+    """Split candidate files into loadable and incompatible for this model."""
+    valid = []
+    skipped = []
+    for path in weight_paths:
+        try:
+            model.load_weights(path)
+            valid.append(path)
+        except Exception as e:
+            reason = str(e).splitlines()[0] if str(e) else type(e).__name__
+            skipped.append((path, reason))
+    return valid, skipped
 
 
 def select_opponents(checkpoints, current_idx):
@@ -650,6 +705,401 @@ def run_match_sequential(candidate_model, opponent_model, label, openings,
     return _tally_results(results, label, elapsed)
 
 
+# ── Tournament mode ──────────────────────────────────────────────────────────
+def _normal_cdf(z):
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def glicko2_pairwise_win_prob(entry_a, entry_b):
+    """Approximate P(A > B) using rating diff and combined RD."""
+    ra = float(entry_a.get("rating", GLICKO2_RATING0))
+    rb = float(entry_b.get("rating", GLICKO2_RATING0))
+    rda = max(1e-9, float(entry_a.get("rd", GLICKO2_RD0)))
+    rdb = max(1e-9, float(entry_b.get("rd", GLICKO2_RD0)))
+    sigma = math.sqrt(rda * rda + rdb * rdb)
+    z = (ra - rb) / sigma
+    return min(1.0, max(0.0, _normal_cdf(z)))
+
+
+def _take_openings(openings, cursor, count):
+    """Take `count` openings from a deterministic cyclic cursor."""
+    if count <= 0 or not openings:
+        return [], cursor
+    n = len(openings)
+    out = []
+    for k in range(count):
+        out.append(openings[(cursor + k) % n])
+    return out, cursor + count
+
+
+def _tourney_rows(ratings_table, weight_paths):
+    rows = []
+    for path in weight_paths:
+        entry = get_glicko2_entry(ratings_table, path, create=True)
+        rows.append((path, entry))
+    rows.sort(
+        key=lambda x: (
+            -float(x[1].get("rating", GLICKO2_RATING0)),
+            float(x[1].get("rd", GLICKO2_RD0)),
+            os.path.basename(x[0]).lower(),
+        )
+    )
+    return rows
+
+
+def _print_tourney_standings(ratings_table, weight_paths):
+    rows = _tourney_rows(ratings_table, weight_paths)
+    print("  Standings:")
+    for i, (path, entry) in enumerate(rows, 1):
+        print(f"    {i:2d}. {os.path.basename(path):30s}  "
+              f"{format_glicko2_entry(entry)}  "
+              f"games {int(entry.get('games', 0))}")
+    return rows
+
+
+def _top_two_contenders_confident(rows, confidence_prob, min_games):
+    if len(rows) < 2:
+        return False
+
+    top_entries = [rows[0][1], rows[1][1]]
+    if any(int(e.get("games", 0)) < min_games for e in top_entries):
+        return False
+
+    rest = rows[2:]
+    if not rest:
+        return True
+
+    for _, contender_entry in rows[:2]:
+        for _, other_entry in rest:
+            p = glicko2_pairwise_win_prob(contender_entry, other_entry)
+            if p < confidence_prob:
+                return False
+    return True
+
+
+def _run_round_robin_to_find_contenders(
+    model_a, model_b, weight_paths, openings,
+    rr_sims=TOURNEY_RR_SIMS,
+    rr_openings=TOURNEY_RR_OPENINGS,
+    max_rounds=TOURNEY_RR_MAX_ROUNDS,
+    contender_prob=TOURNEY_RR_CONTENDER_PROB,
+    min_games=TOURNEY_RR_MIN_GAMES,
+):
+    """Run repeated RR rounds until top-2 contenders are clear or capped."""
+    ratings_table = {}
+    for path in weight_paths:
+        get_glicko2_entry(ratings_table, path, create=True)
+
+    pairs = []
+    for i in range(len(weight_paths)):
+        for j in range(i + 1, len(weight_paths)):
+            pairs.append((weight_paths[i], weight_paths[j]))
+
+    cursor = 0
+    confident = False
+    rounds_played = 0
+
+    for round_idx in range(max_rounds):
+        rounds_played = round_idx + 1
+        round_openings, cursor = _take_openings(openings, cursor, rr_openings)
+        if not round_openings:
+            break
+
+        print(f"\nRound-robin round {rounds_played}/{max_rounds} "
+              f"@ {rr_sims} sims, {len(round_openings) * 2} games per pairing")
+        for left_path, right_path in pairs:
+            left_name = os.path.basename(left_path)
+            right_name = os.path.basename(right_path)
+            label = f"{left_name} vs {right_name} [RR {rounds_played}]"
+
+            model_a.load_weights(left_path)
+            model_b.load_weights(right_path)
+            result = run_match_sequential(
+                model_a, model_b, label,
+                openings=round_openings,
+                sims=rr_sims,
+                batch_size=EVAL_BATCH_SIZE,
+            )
+            apply_match_glicko2_update(
+                ratings_table,
+                left_path,
+                right_path,
+                wins=result["wins"],
+                losses=result["losses"],
+                draws=result["draws"],
+            )
+            print()
+
+        rows = _print_tourney_standings(ratings_table, weight_paths)
+        confident = _top_two_contenders_confident(
+            rows,
+            confidence_prob=contender_prob,
+            min_games=min_games,
+        )
+        if confident:
+            print("  Top-2 contenders are now confident enough to advance.")
+            break
+
+    rows = _tourney_rows(ratings_table, weight_paths)
+    contenders = [rows[0][0], rows[1][0]]
+    return {
+        "contenders": contenders,
+        "rows": rows,
+        "ratings_table": ratings_table,
+        "rounds_played": rounds_played,
+        "confident": confident,
+        "opening_cursor": cursor,
+    }
+
+
+def _run_heads_up_until_confident(
+    model_a, model_b, left_path, right_path, openings,
+    opening_cursor=0,
+    phases=TOURNEY_H2H_PHASES,
+    openings_per_batch=TOURNEY_H2H_OPENINGS_PER_BATCH,
+    confidence_prob=TOURNEY_H2H_CONFIDENCE_PROB,
+    min_games=TOURNEY_H2H_MIN_GAMES,
+    rating_period_games=TOURNEY_H2H_RATING_PERIOD_GAMES,
+    rd_target=TOURNEY_H2H_TARGET_RD,
+):
+    """Run staged heads-up batches until confidence and RD targets are met."""
+    ratings_table = {}
+    get_glicko2_entry(ratings_table, left_path, create=True)
+    get_glicko2_entry(ratings_table, right_path, create=True)
+
+    left_name = os.path.basename(left_path)
+    right_name = os.path.basename(right_path)
+    model_a.load_weights(left_path)
+    model_b.load_weights(right_path)
+
+    batch_idx = 0
+    confident = False
+    winner = None
+    conf = 0.5
+    cursor = opening_cursor
+    min_seen_games = 0
+    max_rd = float("inf")
+    pending_wins = pending_losses = pending_draws = 0
+    pending_games = 0
+
+    def _flush_pending():
+        nonlocal pending_wins, pending_losses, pending_draws, pending_games
+        nonlocal winner, conf, confident, min_seen_games, max_rd
+        if pending_games <= 0:
+            return
+        apply_match_glicko2_update(
+            ratings_table,
+            left_path,
+            right_path,
+            wins=pending_wins,
+            losses=pending_losses,
+            draws=pending_draws,
+        )
+        pending_wins = pending_losses = pending_draws = 0
+        pending_games = 0
+
+        left_entry = get_glicko2_entry(ratings_table, left_path, create=False)
+        right_entry = get_glicko2_entry(ratings_table, right_path, create=False)
+        p_left = glicko2_pairwise_win_prob(left_entry, right_entry)
+        conf = max(p_left, 1.0 - p_left)
+        winner = left_path if p_left >= 0.5 else right_path
+        min_seen_games = min(
+            int(left_entry.get("games", 0)),
+            int(right_entry.get("games", 0)),
+        )
+        max_rd = max(
+            float(left_entry.get("rd", GLICKO2_RD0)),
+            float(right_entry.get("rd", GLICKO2_RD0)),
+        )
+
+        print(f"    Final rating: {left_name} -> {format_glicko2_entry(left_entry)}")
+        print(f"    Final rating: {right_name} -> {format_glicko2_entry(right_entry)}")
+        print(f"    Current leader: {os.path.basename(winner)}  "
+              f"(confidence {100.0 * conf:.1f}%, games {min_seen_games}, "
+              f"max RD {max_rd:.1f})")
+        print()
+
+        if (conf >= confidence_prob and
+                min_seen_games >= min_games and
+                max_rd <= rd_target):
+            confident = True
+
+    for sims, n_batches in phases:
+        for _ in range(n_batches):
+            batch_idx += 1
+            batch_openings, cursor = _take_openings(openings, cursor, openings_per_batch)
+            if not batch_openings:
+                break
+
+            label = f"{left_name} vs {right_name} [Final {batch_idx}, {sims} sims]"
+            result = run_match_sequential(
+                model_a, model_b, label,
+                openings=batch_openings,
+                sims=sims,
+                batch_size=EVAL_BATCH_SIZE,
+            )
+            pending_wins += int(result["wins"])
+            pending_losses += int(result["losses"])
+            pending_draws += int(result["draws"])
+            pending_games += int(result["wins"] + result["losses"] + result["draws"])
+
+            if pending_games >= rating_period_games:
+                _flush_pending()
+                if confident:
+                    break
+        if confident:
+            break
+
+    _flush_pending()
+
+    left_entry = get_glicko2_entry(ratings_table, left_path, create=False)
+    right_entry = get_glicko2_entry(ratings_table, right_path, create=False)
+    if winner is None:
+        winner = left_path if left_entry["rating"] >= right_entry["rating"] else right_path
+        p_left = glicko2_pairwise_win_prob(left_entry, right_entry)
+        conf = max(p_left, 1.0 - p_left)
+
+    return {
+        "winner": winner,
+        "confident": confident,
+        "confidence": conf,
+        "left_entry": left_entry,
+        "right_entry": right_entry,
+        "batches_played": batch_idx,
+        "max_rd": max(
+            float(left_entry.get("rd", GLICKO2_RD0)),
+            float(right_entry.get("rd", GLICKO2_RD0)),
+        ),
+        "opening_cursor": cursor,
+        "ratings_table": ratings_table,
+    }
+
+
+def run_tournament(args):
+    """Best-of-best tournament mode over all weights in a folder."""
+    discovered = find_weight_files(args.tournament_dir)
+    if len(discovered) < 2:
+        print(f"Need at least two weights in {args.tournament_dir}; found {len(discovered)}")
+        return
+
+    print(f"Tournament folder: {args.tournament_dir}")
+    print(f"Discovered {len(discovered)} candidate files:")
+    for i, p in enumerate(discovered, 1):
+        print(f"  {i:2d}. {os.path.basename(p)}")
+    print()
+
+    model_probe = create_model()
+    weight_paths, skipped = _validate_weight_files_for_model(model_probe, discovered)
+    if skipped:
+        print("Skipping incompatible files:")
+        for path, reason in skipped:
+            print(f"  - {os.path.basename(path)}: {reason}")
+        print()
+
+    if len(weight_paths) < 2:
+        print("Need at least two compatible weight files after validation.")
+        return
+
+    if len(weight_paths) != len(discovered):
+        print(f"Using {len(weight_paths)} compatible weight files:")
+        for i, p in enumerate(weight_paths, 1):
+            print(f"  {i:2d}. {os.path.basename(p)}")
+        print()
+
+    rr_needed = 0
+    if len(weight_paths) > 2:
+        rr_needed = TOURNEY_RR_MAX_ROUNDS * TOURNEY_RR_OPENINGS
+    h2h_needed = TOURNEY_H2H_OPENINGS_PER_BATCH * sum(b for _, b in TOURNEY_H2H_PHASES)
+    needed_openings = max(1, rr_needed + h2h_needed)
+    openings = load_or_create_openings(
+        needed_openings,
+        n_plies=args.plies,
+        seed=args.seed,
+    )
+    if not openings:
+        print("Failed to build opening book for tournament.")
+        return
+
+    print(f"Tournament openings pool: {len(openings)} positions")
+    print("Ratings: transient (not writing to persistent glicko2 file)")
+    print()
+
+    import tensorflow as tf
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        print(f"GPU: {gpus[0].name}")
+    else:
+        print("No GPU detected — eval will be slow.")
+
+    model_a = model_probe
+    model_b = create_model()
+
+    opening_cursor = 0
+    if len(weight_paths) == 2:
+        contenders = weight_paths
+        print("\nTwo-player tournament: skipping round robin.")
+    else:
+        rr = _run_round_robin_to_find_contenders(
+            model_a=model_a,
+            model_b=model_b,
+            weight_paths=weight_paths,
+            openings=openings,
+            rr_sims=TOURNEY_RR_SIMS,
+            rr_openings=TOURNEY_RR_OPENINGS,
+            max_rounds=TOURNEY_RR_MAX_ROUNDS,
+            contender_prob=TOURNEY_RR_CONTENDER_PROB,
+            min_games=TOURNEY_RR_MIN_GAMES,
+        )
+        contenders = rr["contenders"]
+        opening_cursor = rr["opening_cursor"]
+
+        print("\nRound-robin result:")
+        print(f"  Rounds played: {rr['rounds_played']}")
+        print(f"  Confident top-2: {'yes' if rr['confident'] else 'no (using best-rated top-2)'}")
+        print(f"  Contenders: {os.path.basename(contenders[0])} vs "
+              f"{os.path.basename(contenders[1])}")
+
+    print("\nHeads-up final configuration:")
+    for sims, n_batches in TOURNEY_H2H_PHASES:
+        n_games = n_batches * TOURNEY_H2H_OPENINGS_PER_BATCH * 2
+        print(f"  {sims} sims: up to {n_games} games")
+    print(f"  Glicko period size: {TOURNEY_H2H_RATING_PERIOD_GAMES} games")
+    print(f"  Confidence target: {100.0 * TOURNEY_H2H_CONFIDENCE_PROB:.1f}%")
+    print(f"  Minimum games before crowning: {TOURNEY_H2H_MIN_GAMES}")
+    print(f"  RD target: <= {TOURNEY_H2H_TARGET_RD:.1f}")
+    print()
+
+    final = _run_heads_up_until_confident(
+        model_a=model_a,
+        model_b=model_b,
+        left_path=contenders[0],
+        right_path=contenders[1],
+        openings=openings,
+        opening_cursor=opening_cursor,
+        phases=TOURNEY_H2H_PHASES,
+        openings_per_batch=TOURNEY_H2H_OPENINGS_PER_BATCH,
+        confidence_prob=TOURNEY_H2H_CONFIDENCE_PROB,
+        min_games=TOURNEY_H2H_MIN_GAMES,
+        rating_period_games=TOURNEY_H2H_RATING_PERIOD_GAMES,
+        rd_target=TOURNEY_H2H_TARGET_RD,
+    )
+
+    winner = final["winner"]
+    runner_up = contenders[1] if winner == contenders[0] else contenders[0]
+    print("=" * 60)
+    print("Tournament final result")
+    print("=" * 60)
+    print(f"  Champion: {os.path.basename(winner)}")
+    print(f"  Runner-up: {os.path.basename(runner_up)}")
+    print(f"  Confidence: {100.0 * final['confidence']:.1f}% "
+          f"({'confident' if final['confident'] else 'not fully confident at cap'})")
+    print(f"  Max RD: {final['max_rd']:.1f} "
+          f"({'target met' if final['max_rd'] <= TOURNEY_H2H_TARGET_RD else 'above target'})")
+    print(f"  Batches played: {final['batches_played']}")
+    print(f"  {os.path.basename(contenders[0])}: {format_glicko2_entry(final['left_entry'])}")
+    print(f"  {os.path.basename(contenders[1])}: {format_glicko2_entry(final['right_entry'])}")
+
+
 # ── Main ────────────────────────────────────────────────────────────────────
 def main():
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
@@ -671,6 +1121,8 @@ def main():
                         help=f"Random plies per opening (default: {EVAL_OPENING_PLIES})")
     parser.add_argument("--weights-dir", type=str, default="weights",
                         help="Directory containing checkpoints")
+    parser.add_argument("--tournament-dir", type=str, default=None,
+                        help="Run best-of-best tournament over all weight files in directory")
     parser.add_argument("--calibrate-sims", action="store_true",
                         help="Calibrate strength gaps between sim budgets "
                              "on one checkpoint")
@@ -680,6 +1132,12 @@ def main():
     parser.add_argument("--no-rating-update", action="store_true",
                         help="Do not update persistent Glicko-2 ratings")
     args = parser.parse_args()
+
+    if args.tournament_dir:
+        if args.calibrate_sims:
+            parser.error("--calibrate-sims cannot be combined with --tournament-dir")
+        run_tournament(args)
+        return
 
     checkpoints = find_checkpoints(args.weights_dir)
     if not checkpoints:
