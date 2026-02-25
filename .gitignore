@@ -24,6 +24,8 @@ mcts_accel.cpython-*.so
 
 # Model weights and training data
 weights/
+best-weights/
+botb-weights/
 *.h5
 *.pkl
 

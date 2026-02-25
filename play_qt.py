@@ -6,7 +6,6 @@ Includes Human-vs-AI (play.py feature parity) and Human-vs-Human modes using
 widgets instead of curses/CLI prompts.
 """
 
-import glob
 import os
 import sys
 import time
@@ -33,58 +32,28 @@ QtCore, QtGui, QtWidgets = _load_pyqt6()
 from gomoku import (
     BOARD_SIZE,
     EMPTY,
-    NUM_INPUT_PLANES,
     PLAYER1,
     PLAYER2,
     GomokuGame,
-    create_model,
-    make_predict_fn,
     mcts_begin,
     mcts_expand_root,
     mcts_process_results,
     mcts_policy,
     mcts_select_leaves,
-    mcts_search_batched,
+)
+from entrypoint_shared import (
+    AIPlayer,
+    AI_MCTS_BATCH,
+    AI_SIMULATIONS,
+    load_model_and_predict_fn,
+    resolve_difficulty,
+    select_weights as select_shared_weights,
 )
 
-# How hard the AI thinks (increase for stronger but slower play)
-AI_SIMULATIONS = 400
-AI_MCTS_BATCH = 8  # small batch = better search quality
 CELL_MIN_SIZE = 30
 INDEX_COL_WIDTH = 26
-DIFFICULTY_SIMS = {
-    "easy": 100,
-    "medium": 400,
-    "hard": 1600,
-}
-
-BEST_WEIGHTS = "weights/gomoku_best.weights.h5"
-LATEST_WEIGHTS = "weights/gomoku_weights.weights.h5"
 ANALYSIS_MAX_SIMS = 1_000_000
 ANALYSIS_EMIT_INTERVAL_SEC = 0.2
-
-
-class AIPlayer:
-    """AI that selects moves via MCTS backed by a trained network."""
-
-    def __init__(self, predict_fn, simulations=AI_SIMULATIONS, difficulty="medium"):
-        self.predict_fn = predict_fn
-        self.sims = simulations
-        self.difficulty = difficulty
-
-    def get_move(self, game):
-        root = mcts_search_batched(
-            game,
-            self.predict_fn,
-            num_simulations=self.sims,
-            batch_size=AI_MCTS_BATCH,
-            c_puct=1.5,
-            add_noise=False,  # no exploration noise during play
-        )
-        pi = mcts_policy(root, temperature=0.05)  # near-greedy
-        idx = int(np.argmax(pi))
-        row, col = divmod(idx, BOARD_SIZE)
-        return row, col, root.q_value
 
 
 class SquareCellButton(QtWidgets.QPushButton):
@@ -190,34 +159,10 @@ class AnalysisWorker(QtCore.QThread):
 
 def select_weights(mode, explicit_path=""):
     """Return (weights_path, label) from UI selection."""
-    mode = (mode or "").strip().lower()
-
-    if mode == "file":
-        wf = os.path.expanduser((explicit_path or "").strip())
-        if not wf:
-            raise ValueError("Select a .h5 file for 'Specific file' mode.")
-        if not wf.endswith(".h5"):
-            raise ValueError("Invalid weight file: expected a .h5 file.")
-        if not os.path.isfile(wf):
-            raise ValueError(f"Specified weight file does not exist: {wf}")
-        return wf, "explicit"
-
-    if mode == "latest":
-        if os.path.exists(LATEST_WEIGHTS):
-            return LATEST_WEIGHTS, "latest"
-    else:
-        if os.path.exists(BEST_WEIGHTS):
-            return BEST_WEIGHTS, "best"
-        if os.path.exists(LATEST_WEIGHTS):
-            return LATEST_WEIGHTS, "latest (no best yet)"
-
-    # Last resort: newest checkpoint file
-    files = glob.glob("weights/gomoku_*.weights.h5")
-    if files:
-        files.sort(key=os.path.getmtime, reverse=True)
-        return files[0], "checkpoint"
-
-    raise ValueError("No weights found in weights/. Run train.py first.")
+    weight_file, label = select_shared_weights(mode=mode, explicit_path=explicit_path)
+    if not weight_file:
+        raise ValueError("No weights found in weights/. Run train.py first.")
+    return weight_file, label
 
 
 class GomokuQtWindow(QtWidgets.QMainWindow):
@@ -259,10 +204,25 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
 
+        self._build_setup_controls(root)
+        self._build_status_panel(root)
+        self._build_board_panel(root)
+
+        self.resize(860, 900)
+        self._update_status_box()
+        self._apply_mode_state()
+
+    def _build_setup_controls(self, root_layout):
         controls = QtWidgets.QGroupBox("Setup")
         form = QtWidgets.QGridLayout(controls)
-        root.addWidget(controls)
+        root_layout.addWidget(controls)
 
+        self._build_weight_controls(form)
+        self._build_difficulty_controls(form)
+        self._build_mode_controls(form)
+        self._build_action_buttons(form)
+
+    def _build_weight_controls(self, form):
         self.weight_mode = QtWidgets.QComboBox()
         self.weight_mode.addItem("Best checkpoint", "best")
         self.weight_mode.addItem("Latest training", "latest")
@@ -281,6 +241,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         self.browse_btn.clicked.connect(self._browse_weight_file)
         form.addWidget(self.browse_btn, 0, 3)
 
+    def _build_difficulty_controls(self, form):
         self.diff_combo = QtWidgets.QComboBox()
         self.diff_combo.addItem("easy", "easy")
         self.diff_combo.addItem("medium", "medium")
@@ -299,6 +260,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         form.addWidget(self.custom_sims, 1, 2)
         form.addWidget(QtWidgets.QLabel("sims"), 1, 3)
 
+    def _build_mode_controls(self, form):
         self.mode_btn = QtWidgets.QPushButton("Switch to Human vs Human")
         self.mode_btn.clicked.connect(self._toggle_mode)
         form.addWidget(self.mode_btn, 2, 0, 1, 2)
@@ -315,7 +277,9 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         form.addWidget(QtWidgets.QLabel("Side"), 3, 0)
         form.addWidget(self.side_combo, 3, 1)
 
+    def _build_action_buttons(self, form):
         btn_row = QtWidgets.QHBoxLayout()
+
         self.load_btn = QtWidgets.QPushButton("Load Model")
         self.load_btn.clicked.connect(self.load_model)
         btn_row.addWidget(self.load_btn)
@@ -336,50 +300,45 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
 
         form.addLayout(btn_row, 4, 0, 1, 4)
 
+    def _build_status_panel(self, root_layout):
         info = QtWidgets.QGroupBox("Status")
-        info_layout = QtWidgets.QGridLayout(info)
-        root.addWidget(info)
+        layout = QtWidgets.QGridLayout(info)
+        root_layout.addWidget(info)
 
-        info_layout.addWidget(QtWidgets.QLabel("Model"), 0, 0)
-        self.model_label = QtWidgets.QLabel("Not loaded")
-        info_layout.addWidget(self.model_label, 0, 1)
+        self.model_label = self._add_status_row(layout, 0, "Model", "Not loaded")
+        self.mode_label = self._add_status_row(layout, 1, "Mode", "-")
+        self.difficulty_label = self._add_status_row(layout, 2, "Difficulty", "-")
+        self.side_label = self._add_status_row(layout, 3, "Side", "-")
+        self.turn_label = self._add_status_row(layout, 4, "Turn", "-")
+        self.moves_label = self._add_status_row(layout, 5, "Moves", "0")
+        self.message_label = self._add_status_row(
+            layout, 6, "Message", "Load model to begin.", word_wrap=True
+        )
+        self.analysis_label = self._add_status_row(layout, 7, "Analysis", "Off")
 
-        info_layout.addWidget(QtWidgets.QLabel("Mode"), 1, 0)
-        self.mode_label = QtWidgets.QLabel("-")
-        info_layout.addWidget(self.mode_label, 1, 1)
+    def _add_status_row(self, layout, row, label, value, word_wrap=False):
+        layout.addWidget(QtWidgets.QLabel(label), row, 0)
+        value_label = QtWidgets.QLabel(value)
+        if word_wrap:
+            value_label.setWordWrap(True)
+        layout.addWidget(value_label, row, 1)
+        return value_label
 
-        info_layout.addWidget(QtWidgets.QLabel("Difficulty"), 2, 0)
-        self.difficulty_label = QtWidgets.QLabel("-")
-        info_layout.addWidget(self.difficulty_label, 2, 1)
-
-        info_layout.addWidget(QtWidgets.QLabel("Side"), 3, 0)
-        self.side_label = QtWidgets.QLabel("-")
-        info_layout.addWidget(self.side_label, 3, 1)
-
-        info_layout.addWidget(QtWidgets.QLabel("Turn"), 4, 0)
-        self.turn_label = QtWidgets.QLabel("-")
-        info_layout.addWidget(self.turn_label, 4, 1)
-
-        info_layout.addWidget(QtWidgets.QLabel("Moves"), 5, 0)
-        self.moves_label = QtWidgets.QLabel("0")
-        info_layout.addWidget(self.moves_label, 5, 1)
-
-        info_layout.addWidget(QtWidgets.QLabel("Message"), 6, 0)
-        self.message_label = QtWidgets.QLabel("Load model to begin.")
-        self.message_label.setWordWrap(True)
-        info_layout.addWidget(self.message_label, 6, 1)
-
-        info_layout.addWidget(QtWidgets.QLabel("Analysis"), 7, 0)
-        self.analysis_label = QtWidgets.QLabel("Off")
-        info_layout.addWidget(self.analysis_label, 7, 1)
-
+    def _build_board_panel(self, root_layout):
         board_frame = QtWidgets.QGroupBox("Board")
         board_layout = QtWidgets.QGridLayout(board_frame)
         board_layout.setHorizontalSpacing(1)
         board_layout.setVerticalSpacing(1)
         board_layout.setContentsMargins(6, 6, 6, 6)
-        root.addWidget(board_frame, 1)
+        root_layout.addWidget(board_frame, 1)
 
+        self._add_board_headers(board_layout)
+        mono = QtGui.QFont("Monospace")
+        mono.setStyleHint(QtGui.QFont.StyleHint.TypeWriter)
+        for r in range(BOARD_SIZE):
+            self._add_board_row(board_layout, r, mono)
+
+    def _add_board_headers(self, board_layout):
         board_layout.setColumnMinimumWidth(0, INDEX_COL_WIDTH)
         for c in range(BOARD_SIZE):
             lbl = QtWidgets.QLabel(f"{c:02d}")
@@ -393,41 +352,34 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
             board_layout.setColumnMinimumWidth(c + 1, CELL_MIN_SIZE)
             board_layout.setColumnStretch(c + 1, 1)
 
-        mono = QtGui.QFont("Monospace")
-        mono.setStyleHint(QtGui.QFont.StyleHint.TypeWriter)
+    def _add_board_row(self, board_layout, row, mono_font):
+        row_lbl = QtWidgets.QLabel(f"{row:02d}")
+        row_lbl.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignRight
+            | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+        row_lbl.setFixedSize(INDEX_COL_WIDTH, CELL_MIN_SIZE)
+        board_layout.addWidget(row_lbl, row + 1, 0)
+        board_layout.setRowMinimumHeight(row + 1, CELL_MIN_SIZE)
+        board_layout.setRowStretch(row + 1, 1)
 
-        for r in range(BOARD_SIZE):
-            row_lbl = QtWidgets.QLabel(f"{r:02d}")
-            row_lbl.setAlignment(
-                QtCore.Qt.AlignmentFlag.AlignRight
-                | QtCore.Qt.AlignmentFlag.AlignVCenter
+        row_btns = []
+        for c in range(BOARD_SIZE):
+            btn = SquareCellButton(".")
+            btn.setMinimumSize(CELL_MIN_SIZE, CELL_MIN_SIZE)
+            btn.setFont(mono_font)
+            btn.clicked.connect(
+                lambda _checked=False, rr=row, cc=c: self.on_cell_clicked(rr, cc)
             )
-            row_lbl.setFixedSize(INDEX_COL_WIDTH, CELL_MIN_SIZE)
-            board_layout.addWidget(row_lbl, r + 1, 0)
-            board_layout.setRowMinimumHeight(r + 1, CELL_MIN_SIZE)
-            board_layout.setRowStretch(r + 1, 1)
-
-            row_btns = []
-            for c in range(BOARD_SIZE):
-                btn = SquareCellButton(".")
-                btn.setMinimumSize(CELL_MIN_SIZE, CELL_MIN_SIZE)
-                btn.setFont(mono)
-                btn.clicked.connect(
-                    lambda _checked=False, rr=r, cc=c: self.on_cell_clicked(rr, cc)
-                )
-                board_layout.addWidget(btn, r + 1, c + 1)
-                row_btns.append(btn)
-            self.board_buttons.append(row_btns)
-
-        self.resize(860, 900)
-        self._update_status_box()
-        self._apply_mode_state()
+            board_layout.addWidget(btn, row + 1, c + 1)
+            row_btns.append(btn)
+        self.board_buttons.append(row_btns)
 
     def _selected_difficulty(self):
         mode = self.diff_combo.currentData()
-        if mode in DIFFICULTY_SIMS:
-            return mode, DIFFICULTY_SIMS[mode]
-        return "Custom", int(self.custom_sims.value())
+        if mode == "custom":
+            return resolve_difficulty(str(int(self.custom_sims.value())))
+        return resolve_difficulty(mode)
 
     def _is_human_only(self):
         return self.human_only_mode
@@ -604,15 +556,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.processEvents()
 
         try:
-            model = create_model()
-            model.load_weights(weight_file)
-            predict_fn = make_predict_fn(model)
-            predict_fn(
-                np.zeros(
-                    (1, BOARD_SIZE, BOARD_SIZE, NUM_INPUT_PLANES),
-                    dtype=np.float32,
-                )
-            )
+            model, predict_fn = load_model_and_predict_fn(weight_file)
         except Exception as e:
             if show_errors:
                 self._show_error(f"Failed to load model:\n{e}")
@@ -885,104 +829,116 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
 
     def _refresh_board(self):
         glyph = {EMPTY: ".", PLAYER1: "X", PLAYER2: "O"}
-        last_move = None
-        if self.game.move_history:
-            last = self.game.move_history[-1]
-            last_move = (int(last[0]), int(last[1]))
-
-        analysis_pi = None
-        analysis_max = 0.0
-        if (self.analysis_policy is not None
-                and self._analysis_should_run()
-                and len(self.analysis_policy) == BOARD_SIZE * BOARD_SIZE):
-            analysis_pi = self.analysis_policy
-            legal_mask = (self.game.board.reshape(-1) == EMPTY)
-            if np.any(legal_mask):
-                analysis_max = float(np.max(analysis_pi[legal_mask]))
+        last_move = self._last_move()
+        analysis_pi, analysis_max = self._analysis_overlay()
 
         for r in range(BOARD_SIZE):
             for c in range(BOARD_SIZE):
                 val = int(self.game.board[r, c])
                 btn = self.board_buttons[r][c]
                 btn.setText(glyph[val])
-
-                # Scale marker size with current square size.
-                cell_px = max(1, min(btn.width(), btn.height()))
-                if val == EMPTY:
-                    font_px = max(8, int(cell_px * 0.30))
-                    color = "#808080"
-                    weight = 500
-                elif val == PLAYER1:
-                    font_px = max(10, int(cell_px * 0.62))
-                    color = "#111111"
-                    weight = 700
-                else:
-                    font_px = max(10, int(cell_px * 0.62))
-                    color = "#0055aa"
-                    weight = 700
-                f = btn.font()
-                f.setPixelSize(font_px)
-                btn.setFont(f)
-
-                is_last_move = (last_move is not None and last_move == (r, c))
-                if is_last_move:
-                    bg = "#ffe9a8"
-                    border = "2px solid #d49100"
-                elif val == EMPTY and analysis_pi is not None and analysis_max > 0.0:
-                    p = float(analysis_pi[r * BOARD_SIZE + c])
-                    t = max(0.0, min(1.0, p / analysis_max))
-                    rr = int(245 - 125 * t)
-                    gg = int(245 - 25 * t)
-                    bb = int(245 - 125 * t)
-                    bg = f"rgb({rr},{gg},{bb})"
-                    border = "2px solid #3b7d3b" if t >= 0.92 else "1px solid #98c598"
-                else:
-                    bg = "#f5f5f5"
-                    border = "1px solid #b8b8b8"
-                btn.setStyleSheet(
-                    "QPushButton {"
-                    f"color: {color};"
-                    f"font-weight: {weight};"
-                    f"background-color: {bg};"
-                    f"border: {border};"
-                    "padding: 0px;"
-                    "}"
-                    "QPushButton:disabled {"
-                    f"color: {color};"
-                    f"background-color: {bg};"
-                    f"border: {border};"
-                    "}"
+                color, weight = self._apply_cell_font(btn, val)
+                bg, border = self._cell_bg_border(
+                    r, c, val, last_move, analysis_pi, analysis_max
                 )
-                if val == EMPTY and analysis_pi is not None:
-                    p = float(analysis_pi[r * BOARD_SIZE + c])
-                    btn.setToolTip(f"MCTS policy: {100.0 * p:.2f}%")
-                else:
-                    btn.setToolTip("")
-                enabled = (
-                    (not self.game_over)
-                    and (val == EMPTY)
-                    and (
-                        self._is_human_only()
-                        or (
-                            self.ai is not None
-                            and self.human_turn
-                        )
-                    )
-                )
-                btn.setEnabled(enabled)
+                self._set_button_style(btn, color, weight, bg, border)
+                self._set_cell_tooltip(btn, val, r, c, analysis_pi)
+                btn.setEnabled(self._cell_enabled(val))
 
-        if self.game_over:
-            turn_text = "Game over"
-        elif self._is_human_only():
-            side = "X" if self.game.current_player == PLAYER1 else "O"
-            turn_text = f"Human turn ({side})"
-        else:
-            side = "X" if self.game.current_player == PLAYER1 else "O"
-            actor = "Your turn" if self.game.current_player == self.human_player else "AI turn"
-            turn_text = f"{actor} ({side})"
-        self.turn_label.setText(turn_text)
+        self.turn_label.setText(self._turn_text())
         self.moves_label.setText(str(len(self.game.move_history)))
         self._update_status_box()
+
+    def _last_move(self):
+        if not self.game.move_history:
+            return None
+        last = self.game.move_history[-1]
+        return int(last[0]), int(last[1])
+
+    def _analysis_overlay(self):
+        if (
+            self.analysis_policy is None
+            or not self._analysis_should_run()
+            or len(self.analysis_policy) != BOARD_SIZE * BOARD_SIZE
+        ):
+            return None, 0.0
+        analysis_pi = self.analysis_policy
+        legal_mask = self.game.board.reshape(-1) == EMPTY
+        if not np.any(legal_mask):
+            return analysis_pi, 0.0
+        return analysis_pi, float(np.max(analysis_pi[legal_mask]))
+
+    def _apply_cell_font(self, btn, val):
+        cell_px = max(1, min(btn.width(), btn.height()))
+        if val == EMPTY:
+            font_px = max(8, int(cell_px * 0.30))
+            color, weight = "#808080", 500
+        elif val == PLAYER1:
+            font_px = max(10, int(cell_px * 0.62))
+            color, weight = "#111111", 700
+        else:
+            font_px = max(10, int(cell_px * 0.62))
+            color, weight = "#0055aa", 700
+        f = btn.font()
+        f.setPixelSize(font_px)
+        btn.setFont(f)
+        return color, weight
+
+    def _cell_bg_border(self, row, col, val, last_move, analysis_pi, analysis_max):
+        if last_move is not None and last_move == (row, col):
+            return "#ffe9a8", "2px solid #d49100"
+        if val == EMPTY and analysis_pi is not None and analysis_max > 0.0:
+            p = float(analysis_pi[row * BOARD_SIZE + col])
+            t = max(0.0, min(1.0, p / analysis_max))
+            rr = int(245 - 125 * t)
+            gg = int(245 - 25 * t)
+            bb = int(245 - 125 * t)
+            bg = f"rgb({rr},{gg},{bb})"
+            border = "2px solid #3b7d3b" if t >= 0.92 else "1px solid #98c598"
+            return bg, border
+        return "#f5f5f5", "1px solid #b8b8b8"
+
+    def _set_button_style(self, btn, color, weight, bg, border):
+        btn.setStyleSheet(
+            "QPushButton {"
+            f"color: {color};"
+            f"font-weight: {weight};"
+            f"background-color: {bg};"
+            f"border: {border};"
+            "padding: 0px;"
+            "}"
+            "QPushButton:disabled {"
+            f"color: {color};"
+            f"background-color: {bg};"
+            f"border: {border};"
+            "}"
+        )
+
+    def _set_cell_tooltip(self, btn, val, row, col, analysis_pi):
+        if val == EMPTY and analysis_pi is not None:
+            p = float(analysis_pi[row * BOARD_SIZE + col])
+            btn.setToolTip(f"MCTS policy: {100.0 * p:.2f}%")
+            return
+        btn.setToolTip("")
+
+    def _cell_enabled(self, val):
+        return (
+            (not self.game_over)
+            and (val == EMPTY)
+            and (
+                self._is_human_only()
+                or (self.ai is not None and self.human_turn)
+            )
+        )
+
+    def _turn_text(self):
+        if self.game_over:
+            return "Game over"
+        side = "X" if self.game.current_player == PLAYER1 else "O"
+        if self._is_human_only():
+            return f"Human turn ({side})"
+        actor = "Your turn" if self.game.current_player == self.human_player else "AI turn"
+        return f"{actor} ({side})"
 
 
 def main():
