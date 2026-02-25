@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-Gomoku tournament mode extracted from eval.py.
+Gomoku tournament runner.
+
+Pipeline:
+1. Swiss seeding over all checkpoints (scales to large fields).
+2. McMahon final stage over a bar-selected top group.
+3. Champion (or shared gold) is promoted to best checkpoint outputs.
 
 Usage:
     python eval_tournament.py --tournament-dir botb-weights
@@ -9,6 +14,9 @@ Usage:
 import argparse
 import glob
 import os
+import pickle
+import re
+import shutil
 
 from book_openings import (
     EVAL_OPENING_PLIES,
@@ -23,25 +31,26 @@ from ratings_glicko2 import (
     format_glicko2_entry,
     get_glicko2_entry,
     glicko2_pairwise_win_prob,
+    load_glicko2_ratings,
+    save_glicko2_ratings,
 )
 
-# Tournament defaults (best-of-best over multiple weight files)
-TOURNEY_RR_SIMS = 50
-TOURNEY_RR_OPENINGS = 8              # 16 games per pairing per round
-TOURNEY_RR_MAX_ROUNDS = 8
-TOURNEY_RR_CONTENDER_PROB = 0.90     # top-2 must beat all others at this p
-TOURNEY_RR_MIN_GAMES = 40
+# Swiss seeding stage (all players)
+TOURNEY_SWISS_SIMS = 50
+TOURNEY_SWISS_OPENINGS = 4   # 8 games per pairing per round
+TOURNEY_SWISS_ROUNDS = 6
 
-# Heads-up final: strong sims for decision quality, then cheap 50-sim
-# squeeze batches to tighten RD if needed.
-TOURNEY_H2H_PHASES = ((200, 6), (400, 4), (50, 8))   # (sims, batches)
-TOURNEY_H2H_OPENINGS_PER_BATCH = 20          # 40 games per batch
-TOURNEY_H2H_CONFIDENCE_PROB = 0.975          # ~2 sigma winner confidence
-TOURNEY_H2H_MIN_GAMES = 120
-TOURNEY_H2H_RATING_PERIOD_GAMES = 200        # aggregate before Glicko update
-TOURNEY_H2H_TARGET_RD = 19.5                 # keep running until RD is below this
-TOURNEY_H2H_SHARED_GOLD_MARGIN = 0.02        # practical tie band (<=52/48)
-TOURNEY_H2H_SHARED_GOLD_MIN_GAMES = 120
+# McMahon final stage (top bar-selected players)
+TOURNEY_MCM_SIMS = 100
+TOURNEY_MCM_OPENINGS = 8     # 16 games per pairing per round
+TOURNEY_MCM_ROUNDS = 5
+TOURNEY_MCM_BAR_GAP = 80.0   # include players within this rating gap from leader
+TOURNEY_MCM_MIN_PLAYERS = 8
+TOURNEY_MCM_MAX_PLAYERS = 24
+
+# Practical tie policy for champion decision
+TOURNEY_SHARED_GOLD_MARGIN = 0.02
+TOURNEY_SHARED_GOLD_MIN_GAMES = 120
 
 
 def find_weight_files(weights_dir):
@@ -79,32 +88,115 @@ def _cfg(args, key, default):
     return getattr(args, key, default)
 
 
-def _build_config(args):
+def _default_tournament_output_paths(tournament_dir):
+    base_dir = os.path.normpath(str(tournament_dir)) if tournament_dir else "weights"
     return {
-        "rr_sims": _cfg(args, "rr_sims", TOURNEY_RR_SIMS),
-        "rr_openings": _cfg(args, "rr_openings", TOURNEY_RR_OPENINGS),
-        "rr_max_rounds": _cfg(args, "rr_max_rounds", TOURNEY_RR_MAX_ROUNDS),
-        "rr_contender_prob": _cfg(args, "rr_contender_prob", TOURNEY_RR_CONTENDER_PROB),
-        "rr_min_games": _cfg(args, "rr_min_games", TOURNEY_RR_MIN_GAMES),
-        "h2h_phases": _cfg(args, "h2h_phases", TOURNEY_H2H_PHASES),
-        "h2h_openings_per_batch": _cfg(
-            args, "h2h_openings_per_batch", TOURNEY_H2H_OPENINGS_PER_BATCH
+        "ratings_file": os.path.join(base_dir, "glicko2_ratings.pkl"),
+        "best_weights_file": os.path.join(base_dir, "gomoku_best.weights.h5"),
+        "best_state_file": os.path.join(base_dir, "best_checkpoint.pkl"),
+    }
+
+
+def _build_config(args):
+    defaults = _default_tournament_output_paths(getattr(args, "tournament_dir", None))
+    ratings_file = getattr(args, "ratings_file", None) or defaults["ratings_file"]
+    best_weights_file = (
+        getattr(args, "best_weights_file", None) or defaults["best_weights_file"]
+    )
+    best_state_file = (
+        getattr(args, "best_state_file", None) or defaults["best_state_file"]
+    )
+    return {
+        "swiss_sims": _cfg(args, "swiss_sims", TOURNEY_SWISS_SIMS),
+        "swiss_openings": _cfg(args, "swiss_openings", TOURNEY_SWISS_OPENINGS),
+        "swiss_rounds": _cfg(args, "swiss_rounds", TOURNEY_SWISS_ROUNDS),
+        "mcmahon_sims": _cfg(args, "mcmahon_sims", TOURNEY_MCM_SIMS),
+        "mcmahon_openings": _cfg(args, "mcmahon_openings", TOURNEY_MCM_OPENINGS),
+        "mcmahon_rounds": _cfg(args, "mcmahon_rounds", TOURNEY_MCM_ROUNDS),
+        "mcmahon_bar_gap": float(_cfg(args, "mcmahon_bar_gap", TOURNEY_MCM_BAR_GAP)),
+        "mcmahon_min_players": int(
+            _cfg(args, "mcmahon_min_players", TOURNEY_MCM_MIN_PLAYERS)
         ),
-        "h2h_confidence_prob": _cfg(
-            args, "h2h_confidence_prob", TOURNEY_H2H_CONFIDENCE_PROB
+        "mcmahon_max_players": int(
+            _cfg(args, "mcmahon_max_players", TOURNEY_MCM_MAX_PLAYERS)
         ),
-        "h2h_min_games": _cfg(args, "h2h_min_games", TOURNEY_H2H_MIN_GAMES),
-        "h2h_rating_period_games": _cfg(
-            args, "h2h_rating_period_games", TOURNEY_H2H_RATING_PERIOD_GAMES
+        "shared_gold_margin": _cfg(args, "shared_gold_margin", TOURNEY_SHARED_GOLD_MARGIN),
+        "shared_gold_min_games": _cfg(
+            args, "shared_gold_min_games", TOURNEY_SHARED_GOLD_MIN_GAMES
         ),
-        "h2h_target_rd": _cfg(args, "h2h_target_rd", TOURNEY_H2H_TARGET_RD),
-        "h2h_shared_gold_margin": _cfg(
-            args, "shared_gold_margin", TOURNEY_H2H_SHARED_GOLD_MARGIN
-        ),
-        "h2h_shared_gold_min_games": _cfg(
-            args, "shared_gold_min_games", TOURNEY_H2H_SHARED_GOLD_MIN_GAMES
+        "persist_ratings": bool(_cfg(args, "persist_ratings", True)),
+        "ratings_file": ratings_file,
+        "promote_winner": bool(_cfg(args, "promote_winner", True)),
+        "best_weights_file": best_weights_file,
+        "best_state_file": best_state_file,
+    }
+
+
+def _load_ratings_table(config):
+    if not config["persist_ratings"]:
+        print("Ratings: transient (not writing to persistent glicko2 file)")
+        print()
+        return {}
+
+    ratings_file = config["ratings_file"]
+    table = load_glicko2_ratings(ratings_file)
+    print(f"Ratings: persistent ({ratings_file})")
+    print()
+    return table
+
+
+def _save_ratings_table_if_enabled(config, ratings_table):
+    if not config["persist_ratings"]:
+        return
+    save_glicko2_ratings(ratings_table, config["ratings_file"])
+    print(f"Saved ratings -> {config['ratings_file']}")
+
+
+def _checkpoint_game_count(path):
+    m = re.search(r"_g(\d{5})\.weights\.h5$", os.path.basename(path))
+    if not m:
+        return 0
+    return int(m.group(1))
+
+
+def _pick_promoted_winner(final):
+    winner = final.get("winner")
+    if winner:
+        return winner, "McMahon champion"
+
+    shared = final.get("shared_gold_paths") or []
+    if shared:
+        best = max(shared, key=lambda row: row["rating"])
+        return best["path"], "shared-gold tie break by rating"
+
+    rows = final.get("rows") or []
+    if rows:
+        return rows[0]["path"], "top McMahon score"
+    return None, "no champion resolved"
+
+
+def _write_best_checkpoint(config, promoted_path, ratings_table):
+    best_weights_file = config["best_weights_file"]
+    best_state_file = config["best_state_file"]
+    weights_dir = os.path.dirname(best_weights_file)
+    state_dir = os.path.dirname(best_state_file)
+    if weights_dir:
+        os.makedirs(weights_dir, exist_ok=True)
+    if state_dir:
+        os.makedirs(state_dir, exist_ok=True)
+
+    shutil.copy2(promoted_path, best_weights_file)
+    promoted_entry = get_glicko2_entry(ratings_table, promoted_path, create=False)
+    best_state = {
+        "path": promoted_path,
+        "game_count": _checkpoint_game_count(promoted_path),
+        "glicko2_vs_long": (
+            promoted_entry.get("rating") if promoted_entry is not None else None
         ),
     }
+    with open(best_state_file, "wb") as f:
+        pickle.dump(best_state, f)
+    return best_state
 
 
 def _take_openings(openings, cursor, count):
@@ -132,59 +224,218 @@ def _tourney_rows(ratings_table, weight_paths):
     return rows
 
 
-def _print_tourney_standings(ratings_table, weight_paths):
+def _print_tourney_standings(ratings_table, weight_paths, limit=None):
     rows = _tourney_rows(ratings_table, weight_paths)
-    print("  Standings:")
-    for i, (path, entry) in enumerate(rows, 1):
+    shown = rows if limit is None else rows[: max(1, int(limit))]
+    print("  Rating ladder:")
+    for i, (path, entry) in enumerate(shown, 1):
         print(f"    {i:2d}. {os.path.basename(path):30s}  "
               f"{format_glicko2_entry(entry)}  "
               f"games {int(entry.get('games', 0))}")
+    if limit is not None and len(rows) > len(shown):
+        print(f"    ... +{len(rows) - len(shown)} more")
     return rows
 
 
-def _top_two_contenders_confident(rows, confidence_prob, min_games):
-    if len(rows) < 2:
-        return False
-
-    top_entries = [rows[0][1], rows[1][1]]
-    if any(int(e.get("games", 0)) < min_games for e in top_entries):
-        return False
-
-    rest = rows[2:]
-    if not rest:
-        return True
-
-    for _, contender_entry in rows[:2]:
-        for _, other_entry in rest:
-            p = glicko2_pairwise_win_prob(contender_entry, other_entry)
-            if p < confidence_prob:
-                return False
-    return True
+def _new_stage_stats(paths):
+    stats = {}
+    for path in paths:
+        stats[path] = {
+            "score": 0.0,     # match points (W=1, D=0.5, L=0)
+            "gp": 0.0,        # game points (wins + 0.5*draws)
+            "games": 0,
+            "rounds": 0,
+            "byes": 0,
+            "opponents": [],
+        }
+    return stats
 
 
-def _round_robin_pairs(weight_paths):
+def _stats_entry(stats, path):
+    return stats[path]
+
+
+def _stage_sort_key(path, stats, ratings_table):
+    row = _stats_entry(stats, path)
+    entry = get_glicko2_entry(ratings_table, path, create=True)
+    score = float(row["score"])
+    gp = float(row["gp"])
+    games = max(1, int(row["games"]))
+    gp_rate = gp / float(games)
+    return (
+        -score,
+        -gp_rate,
+        -float(entry.get("rating", GLICKO2_RATING0)),
+        float(entry.get("rd", GLICKO2_RD0)),
+        os.path.basename(path).lower(),
+    )
+
+
+def _ordered_players(paths, stats, ratings_table):
+    return sorted(paths, key=lambda p: _stage_sort_key(p, stats, ratings_table))
+
+
+def _select_bye_player(ordered_paths, stats):
+    # Lowest seeded players get byes first; avoid multiple byes when possible.
+    candidate = None
+    candidate_key = None
+    for path in reversed(ordered_paths):
+        row = _stats_entry(stats, path)
+        key = (
+            int(row["byes"]),
+            float(row["score"]),
+            int(row["games"]),
+            os.path.basename(path).lower(),
+        )
+        if candidate is None or key < candidate_key:
+            candidate = path
+            candidate_key = key
+    return candidate
+
+
+def _find_non_repeat_partner_index(left_path, candidates, played_pairs):
+    for i, right_path in enumerate(candidates):
+        pair_key = tuple(sorted((left_path, right_path)))
+        if pair_key not in played_pairs:
+            return i
+    return None
+
+
+def _pair_round_players(ordered_paths, stats, played_pairs):
+    work = list(ordered_paths)
+    bye_path = None
+    if len(work) % 2 == 1:
+        bye_path = _select_bye_player(work, stats)
+        work.remove(bye_path)
+
     pairs = []
-    for i in range(len(weight_paths)):
-        for j in range(i + 1, len(weight_paths)):
-            pairs.append((weight_paths[i], weight_paths[j]))
-    return pairs
+    while len(work) >= 2:
+        left_path = work.pop(0)
+        partner_idx = _find_non_repeat_partner_index(left_path, work, played_pairs)
+        if partner_idx is None:
+            partner_idx = 0
+        right_path = work.pop(partner_idx)
+        pairs.append((left_path, right_path))
+    return pairs, bye_path
 
 
-def _run_round_robin_pairing(
+def _award_bye(stats, path):
+    row = _stats_entry(stats, path)
+    row["score"] += 1.0
+    row["rounds"] += 1
+    row["byes"] += 1
+
+
+def _result_to_points(result):
+    wins = int(result.get("wins", 0))
+    losses = int(result.get("losses", 0))
+    draws = int(result.get("draws", 0))
+    total_games = wins + losses + draws
+    left_gp = float(wins) + 0.5 * float(draws)
+    right_gp = float(losses) + 0.5 * float(draws)
+
+    if left_gp > right_gp:
+        left_mp, right_mp = 1.0, 0.0
+    elif right_gp > left_gp:
+        left_mp, right_mp = 0.0, 1.0
+    else:
+        left_mp, right_mp = 0.5, 0.5
+
+    return {
+        "wins": wins,
+        "losses": losses,
+        "draws": draws,
+        "total_games": total_games,
+        "left_gp": left_gp,
+        "right_gp": right_gp,
+        "left_mp": left_mp,
+        "right_mp": right_mp,
+    }
+
+
+def _apply_stage_result(stats, left_path, right_path, result):
+    scored = _result_to_points(result)
+    left_row = _stats_entry(stats, left_path)
+    right_row = _stats_entry(stats, right_path)
+
+    left_row["score"] += scored["left_mp"]
+    right_row["score"] += scored["right_mp"]
+    left_row["gp"] += scored["left_gp"]
+    right_row["gp"] += scored["right_gp"]
+    left_row["games"] += scored["total_games"]
+    right_row["games"] += scored["total_games"]
+    left_row["rounds"] += 1
+    right_row["rounds"] += 1
+    left_row["opponents"].append(right_path)
+    right_row["opponents"].append(left_path)
+
+    return scored
+
+
+def _stage_rows(stage_paths, stats, ratings_table):
+    rows = []
+    for path in stage_paths:
+        st = _stats_entry(stats, path)
+        entry = get_glicko2_entry(ratings_table, path, create=True)
+        games = max(1, int(st["games"]))
+        rows.append({
+            "path": path,
+            "score": float(st["score"]),
+            "gp": float(st["gp"]),
+            "gp_rate": float(st["gp"]) / float(games),
+            "games": int(st["games"]),
+            "rounds": int(st["rounds"]),
+            "byes": int(st["byes"]),
+            "rating": float(entry.get("rating", GLICKO2_RATING0)),
+            "rd": float(entry.get("rd", GLICKO2_RD0)),
+            "entry": entry,
+        })
+    rows.sort(
+        key=lambda r: (
+            -r["score"],
+            -r["gp_rate"],
+            -r["rating"],
+            r["rd"],
+            os.path.basename(r["path"]).lower(),
+        )
+    )
+    return rows
+
+
+def _print_stage_leaderboard(stage_name, stage_paths, stats, ratings_table, limit=12):
+    rows = _stage_rows(stage_paths, stats, ratings_table)
+    shown = rows[: max(1, int(limit))]
+    print(f"\n{stage_name} leaderboard:")
+    for i, row in enumerate(shown, 1):
+        print(
+            f"  {i:2d}. {os.path.basename(row['path']):30s}  "
+            f"score {row['score']:.1f}  "
+            f"gp {row['gp_rate']:.3f}  "
+            f"{format_glicko2_entry(row['entry'])}"
+        )
+    if len(rows) > len(shown):
+        print(f"  ... +{len(rows) - len(shown)} more")
+    return rows
+
+
+def _run_stage_pairing(
     model_a,
     model_b,
-    ratings_table,
+    stage_tag,
+    round_idx,
     left_path,
     right_path,
     round_openings,
-    rr_sims,
-    round_idx,
-    run_match_fn,
+    sims,
     eval_batch_size,
+    run_match_fn,
+    ratings_table,
+    stage_stats,
+    played_pairs,
 ):
     left_name = os.path.basename(left_path)
     right_name = os.path.basename(right_path)
-    label = f"{left_name} vs {right_name} [RR {round_idx}]"
+    label = f"{left_name} vs {right_name} [{stage_tag} {round_idx}]"
 
     model_a.load_weights(left_path)
     model_b.load_weights(right_path)
@@ -193,9 +444,10 @@ def _run_round_robin_pairing(
         model_b,
         label,
         openings=round_openings,
-        sims=rr_sims,
+        sims=sims,
         batch_size=eval_batch_size,
     )
+
     apply_match_glicko2_update(
         ratings_table,
         left_path,
@@ -204,405 +456,144 @@ def _run_round_robin_pairing(
         losses=result["losses"],
         draws=result["draws"],
     )
+    _apply_stage_result(stage_stats, left_path, right_path, result)
+    played_pairs.add(tuple(sorted((left_path, right_path))))
     print()
 
 
-def _run_round_robin_to_find_contenders(
+def _run_pairing_stage(
     model_a,
     model_b,
-    weight_paths,
+    stage_name,
+    stage_tag,
+    stage_paths,
     openings,
+    opening_cursor,
+    rounds,
+    sims,
+    openings_per_round,
     run_match_fn,
     eval_batch_size,
-    config,
+    ratings_table,
+    initial_stats=None,
+    seed_played_pairs=None,
 ):
-    ratings_table = {}
-    for path in weight_paths:
-        get_glicko2_entry(ratings_table, path, create=True)
-    pairs = _round_robin_pairs(weight_paths)
-
-    cursor = 0
-    confident = False
+    stats = initial_stats if initial_stats is not None else _new_stage_stats(stage_paths)
+    played_pairs = set(seed_played_pairs or [])
+    cursor = int(opening_cursor)
     rounds_played = 0
-    rr_sims = config["rr_sims"]
-    rr_openings = config["rr_openings"]
-    rr_max_rounds = config["rr_max_rounds"]
-    rr_contender_prob = config["rr_contender_prob"]
-    rr_min_games = config["rr_min_games"]
 
-    for round_idx in range(rr_max_rounds):
-        rounds_played = round_idx + 1
-        round_openings, cursor = _take_openings(openings, cursor, rr_openings)
+    for round_idx in range(1, max(0, int(rounds)) + 1):
+        round_openings, cursor = _take_openings(openings, cursor, openings_per_round)
         if not round_openings:
             break
+        rounds_played = round_idx
 
-        print(f"\nRound-robin round {rounds_played}/{rr_max_rounds} "
-              f"@ {rr_sims} sims, {len(round_openings) * 2} games per pairing")
+        ordered = _ordered_players(stage_paths, stats, ratings_table)
+        pairs, bye_path = _pair_round_players(ordered, stats, played_pairs)
+        print(f"\n{stage_name} round {round_idx}/{rounds} "
+              f"@ {sims} sims, {len(round_openings) * 2} games/pairing")
+        print(f"  Pairings: {len(pairs)}")
+        if bye_path:
+            _award_bye(stats, bye_path)
+            print(f"  Bye: {os.path.basename(bye_path)} (+1.0 match point)")
+
         for left_path, right_path in pairs:
-            _run_round_robin_pairing(
-                model_a,
-                model_b,
-                ratings_table,
-                left_path,
-                right_path,
-                round_openings,
-                rr_sims,
-                rounds_played,
-                run_match_fn,
-                eval_batch_size,
+            _run_stage_pairing(
+                model_a=model_a,
+                model_b=model_b,
+                stage_tag=stage_tag,
+                round_idx=round_idx,
+                left_path=left_path,
+                right_path=right_path,
+                round_openings=round_openings,
+                sims=sims,
+                eval_batch_size=eval_batch_size,
+                run_match_fn=run_match_fn,
+                ratings_table=ratings_table,
+                stage_stats=stats,
+                played_pairs=played_pairs,
             )
 
-        rows = _print_tourney_standings(ratings_table, weight_paths)
-        confident = _top_two_contenders_confident(
-            rows,
-            confidence_prob=rr_contender_prob,
-            min_games=rr_min_games,
-        )
-        if confident:
-            print("  Top-2 contenders are now confident enough to advance.")
-            break
+        _print_stage_leaderboard(stage_name, stage_paths, stats, ratings_table)
 
-    rows = _tourney_rows(ratings_table, weight_paths)
-    contenders = [rows[0][0], rows[1][0]]
     return {
-        "contenders": contenders,
-        "rows": rows,
-        "ratings_table": ratings_table,
+        "stats": stats,
+        "played_pairs": played_pairs,
         "rounds_played": rounds_played,
-        "confident": confident,
         "opening_cursor": cursor,
-    }
-
-
-def _new_heads_up_state(opening_cursor):
-    return {
-        "batch_idx": 0,
-        "confident": False,
-        "shared_gold": False,
-        "winner": None,
-        "confidence": 0.5,
-        "cursor": opening_cursor,
-        "min_seen_games": 0,
-        "max_rd": float("inf"),
-        "pending_wins": 0,
-        "pending_losses": 0,
-        "pending_draws": 0,
-        "pending_games": 0,
-        "total_wins": 0,
-        "total_losses": 0,
-        "total_draws": 0,
-        "total_games": 0,
-        "total_score_left": 0.0,
-        "score_left": 0.5,
-    }
-
-
-def _flush_heads_up_pending(
-    state,
-    ratings_table,
-    left_path,
-    right_path,
-    left_name,
-    right_name,
-    confidence_prob,
-    min_games,
-    rd_target,
-    shared_gold_margin,
-    shared_gold_min_games,
-):
-    if state["pending_games"] <= 0:
-        return
-
-    apply_match_glicko2_update(
-        ratings_table,
-        left_path,
-        right_path,
-        wins=state["pending_wins"],
-        losses=state["pending_losses"],
-        draws=state["pending_draws"],
-    )
-    state["pending_wins"] = 0
-    state["pending_losses"] = 0
-    state["pending_draws"] = 0
-    state["pending_games"] = 0
-
-    left_entry = get_glicko2_entry(ratings_table, left_path, create=False)
-    right_entry = get_glicko2_entry(ratings_table, right_path, create=False)
-    p_left = glicko2_pairwise_win_prob(left_entry, right_entry)
-    state["confidence"] = max(p_left, 1.0 - p_left)
-    state["winner"] = left_path if p_left >= 0.5 else right_path
-    state["min_seen_games"] = min(
-        int(left_entry.get("games", 0)),
-        int(right_entry.get("games", 0)),
-    )
-    state["max_rd"] = max(
-        float(left_entry.get("rd", GLICKO2_RD0)),
-        float(right_entry.get("rd", GLICKO2_RD0)),
-    )
-    state["total_games"] = (
-        int(state["total_wins"])
-        + int(state["total_losses"])
-        + int(state["total_draws"])
-    )
-    state["total_score_left"] = (
-        float(state["total_wins"])
-        + 0.5 * float(state["total_draws"])
-    )
-    if state["total_games"] > 0:
-        state["score_left"] = state["total_score_left"] / float(state["total_games"])
-    else:
-        state["score_left"] = 0.5
-
-    print(f"    Final rating: {left_name} -> {format_glicko2_entry(left_entry)}")
-    print(f"    Final rating: {right_name} -> {format_glicko2_entry(right_entry)}")
-    print(f"    Current leader: {os.path.basename(state['winner'])}  "
-          f"(confidence {100.0 * state['confidence']:.1f}%, "
-          f"games {state['min_seen_games']}, max RD {state['max_rd']:.1f})")
-    print(
-        f"    Match score: {left_name} {100.0 * state['score_left']:.1f}% "
-        f"({state['total_wins']}W {state['total_losses']}L {state['total_draws']}D)"
-    )
-    print()
-
-    if (state["confidence"] >= confidence_prob and
-            state["min_seen_games"] >= min_games and
-            state["max_rd"] <= rd_target):
-        state["confident"] = True
-        state["shared_gold"] = False
-        return
-
-    if (state["total_games"] >= shared_gold_min_games and
-            abs(state["score_left"] - 0.5) <= shared_gold_margin):
-        state["shared_gold"] = True
-        state["winner"] = None
-        state["confident"] = True
-        print(
-            "    Shared gold: practical tie detected "
-            f"(within ±{100.0 * shared_gold_margin:.1f}% around 50/50)."
-        )
-        print()
-
-
-def _run_heads_up_batch(
-    model_a,
-    model_b,
-    state,
-    openings,
-    openings_per_batch,
-    left_name,
-    right_name,
-    sims,
-    shared_gold_margin,
-    shared_gold_min_games,
-    run_match_fn,
-    eval_batch_size,
-):
-    state["batch_idx"] += 1
-    batch_openings, state["cursor"] = _take_openings(
-        openings, state["cursor"], openings_per_batch
-    )
-    if not batch_openings:
-        return False
-
-    label = f"{left_name} vs {right_name} [Final {state['batch_idx']}, {sims} sims]"
-    result = run_match_fn(
-        model_a,
-        model_b,
-        label,
-        openings=batch_openings,
-        sims=sims,
-        batch_size=eval_batch_size,
-    )
-    state["pending_wins"] += int(result["wins"])
-    state["pending_losses"] += int(result["losses"])
-    state["pending_draws"] += int(result["draws"])
-    state["pending_games"] += int(result["wins"] + result["losses"] + result["draws"])
-    state["total_wins"] += int(result["wins"])
-    state["total_losses"] += int(result["losses"])
-    state["total_draws"] += int(result["draws"])
-    total_games = (
-        int(state["total_wins"])
-        + int(state["total_losses"])
-        + int(state["total_draws"])
-    )
-    total_score_left = float(state["total_wins"]) + 0.5 * float(state["total_draws"])
-    score_left = (total_score_left / float(total_games)) if total_games > 0 else 0.5
-    state["total_games"] = total_games
-    state["total_score_left"] = total_score_left
-    state["score_left"] = score_left
-
-    if (total_games >= shared_gold_min_games and
-            abs(score_left - 0.5) <= shared_gold_margin):
-        state["shared_gold"] = True
-        state["winner"] = None
-        state["confident"] = True
-        print(
-            "    Shared gold: practical tie detected early "
-            f"after {total_games} games "
-            f"(score {100.0 * score_left:.1f}% within "
-            f"±{100.0 * shared_gold_margin:.1f}%)."
-        )
-        print()
-    return True
-
-
-def _run_heads_up_phases(
-    model_a,
-    model_b,
-    state,
-    ratings_table,
-    match,
-    openings,
-    phases,
-    openings_per_batch,
-    rating_period_games,
-    run_match_fn,
-    eval_batch_size,
-):
-    for sims, n_batches in phases:
-        for _ in range(n_batches):
-            ran_batch = _run_heads_up_batch(
-                model_a,
-                model_b,
-                state,
-                openings,
-                openings_per_batch,
-                match["left_name"],
-                match["right_name"],
-                sims,
-                match["shared_gold_margin"],
-                match["shared_gold_min_games"],
-                run_match_fn,
-                eval_batch_size,
-            )
-            if not ran_batch:
-                break
-            if state["confident"]:
-                break
-
-            if state["pending_games"] >= rating_period_games:
-                _flush_heads_up_for_match(state, ratings_table, match)
-                if state["confident"]:
-                    break
-        if state["confident"]:
-            break
-
-
-def _build_heads_up_context(
-    model_a,
-    model_b,
-    left_path,
-    right_path,
-    opening_cursor,
-    config,
-):
-    ratings_table = {}
-    get_glicko2_entry(ratings_table, left_path, create=True)
-    get_glicko2_entry(ratings_table, right_path, create=True)
-    model_a.load_weights(left_path)
-    model_b.load_weights(right_path)
-    match = {
-        "left_path": left_path,
-        "right_path": right_path,
-        "left_name": os.path.basename(left_path),
-        "right_name": os.path.basename(right_path),
-        "confidence_prob": config["h2h_confidence_prob"],
-        "min_games": config["h2h_min_games"],
-        "rd_target": config["h2h_target_rd"],
-        "shared_gold_margin": config["h2h_shared_gold_margin"],
-        "shared_gold_min_games": config["h2h_shared_gold_min_games"],
-    }
-    return ratings_table, _new_heads_up_state(opening_cursor), match
-
-
-def _flush_heads_up_for_match(state, ratings_table, match):
-    _flush_heads_up_pending(
-        state,
-        ratings_table,
-        match["left_path"],
-        match["right_path"],
-        match["left_name"],
-        match["right_name"],
-        match["confidence_prob"],
-        match["min_games"],
-        match["rd_target"],
-        match["shared_gold_margin"],
-        match["shared_gold_min_games"],
-    )
-
-
-def _finalize_heads_up_entries(state, ratings_table, left_path, right_path):
-    left_entry = get_glicko2_entry(ratings_table, left_path, create=False)
-    right_entry = get_glicko2_entry(ratings_table, right_path, create=False)
-    if state["winner"] is None and not state["shared_gold"]:
-        state["winner"] = (
-            left_path if left_entry["rating"] >= right_entry["rating"] else right_path
-        )
-        p_left = glicko2_pairwise_win_prob(left_entry, right_entry)
-        state["confidence"] = max(p_left, 1.0 - p_left)
-    return left_entry, right_entry
-
-
-def _build_heads_up_result(state, ratings_table, match):
-    left_entry, right_entry = _finalize_heads_up_entries(
-        state,
-        ratings_table,
-        match["left_path"],
-        match["right_path"],
-    )
-    return {
-        "winner": state["winner"],
-        "shared_gold": state["shared_gold"],
-        "confident": state["confident"],
-        "confidence": state["confidence"],
-        "score_left": state["score_left"],
-        "total_games": state["total_games"],
-        "left_entry": left_entry,
-        "right_entry": right_entry,
-        "batches_played": state["batch_idx"],
-        "max_rd": max(
-            float(left_entry.get("rd", GLICKO2_RD0)),
-            float(right_entry.get("rd", GLICKO2_RD0)),
-        ),
-        "opening_cursor": state["cursor"],
         "ratings_table": ratings_table,
     }
 
 
-def _run_heads_up_until_confident(
-    model_a,
-    model_b,
-    left_path,
-    right_path,
-    openings,
-    opening_cursor,
-    config,
-    run_match_fn,
-    eval_batch_size,
-):
-    ratings_table, state, match = _build_heads_up_context(
-        model_a,
-        model_b,
-        left_path,
-        right_path,
-        opening_cursor,
-        config,
-    )
-    _run_heads_up_phases(
-        model_a,
-        model_b,
-        state,
-        ratings_table,
-        match,
-        openings,
-        config["h2h_phases"],
-        config["h2h_openings_per_batch"],
-        config["h2h_rating_period_games"],
-        run_match_fn,
-        eval_batch_size,
-    )
-    _flush_heads_up_for_match(state, ratings_table, match)
-    return _build_heads_up_result(state, ratings_table, match)
+def _select_mcmahon_finalists(weight_paths, ratings_table, config):
+    rows = _tourney_rows(ratings_table, weight_paths)
+    total = len(rows)
+    if total == 0:
+        return [], None, rows
+
+    bar_gap = float(config["mcmahon_bar_gap"])
+    min_players = max(2, int(config["mcmahon_min_players"]))
+    max_players = max(min_players, int(config["mcmahon_max_players"]))
+    min_players = min(min_players, total)
+    max_players = min(max_players, total)
+
+    top_rating = float(rows[0][1].get("rating", GLICKO2_RATING0))
+    finalists = [
+        path for path, entry in rows
+        if float(entry.get("rating", GLICKO2_RATING0)) >= (top_rating - bar_gap)
+    ]
+    if len(finalists) < min_players:
+        finalists = [path for path, _ in rows[:min_players]]
+    if len(finalists) > max_players:
+        finalists = finalists[:max_players]
+
+    bar_index = min(len(finalists), total) - 1
+    bar_rating = float(rows[bar_index][1].get("rating", GLICKO2_RATING0))
+    return finalists, bar_rating, rows
+
+
+def _resolve_mcmahon_result(rows, ratings_table, config):
+    if not rows:
+        return {
+            "winner": None,
+            "shared_gold": False,
+            "shared_gold_paths": [],
+            "rows": [],
+            "top_two_prob": None,
+            "ratings_table": ratings_table,
+        }
+
+    winner = rows[0]["path"]
+    shared_gold = False
+    shared_gold_paths = []
+    top_two_prob = None
+
+    if len(rows) >= 2 and abs(rows[0]["score"] - rows[1]["score"]) < 1e-12:
+        first = rows[0]
+        second = rows[1]
+        p_first = glicko2_pairwise_win_prob(first["entry"], second["entry"])
+        top_two_prob = p_first
+        min_games = min(
+            int(first["entry"].get("games", 0)),
+            int(second["entry"].get("games", 0)),
+        )
+        if (
+            min_games >= int(config["shared_gold_min_games"])
+            and abs(p_first - 0.5) <= float(config["shared_gold_margin"])
+        ):
+            shared_gold = True
+            winner = None
+            shared_gold_paths = [first, second]
+
+    return {
+        "winner": winner,
+        "shared_gold": shared_gold,
+        "shared_gold_paths": shared_gold_paths,
+        "rows": rows,
+        "top_two_prob": top_two_prob,
+        "ratings_table": ratings_table,
+    }
 
 
 def _print_tournament_candidates(tournament_dir, discovered):
@@ -633,14 +624,12 @@ def _resolve_compatible_weight_paths(model_probe, discovered):
     return weight_paths
 
 
-def _load_tournament_openings(args, weight_paths, config):
-    rr_needed = 0
-    if len(weight_paths) > 2:
-        rr_needed = config["rr_max_rounds"] * config["rr_openings"]
-    h2h_needed = config["h2h_openings_per_batch"] * sum(
-        n_batches for _, n_batches in config["h2h_phases"]
+def _load_tournament_openings(args, config):
+    needed_openings = max(
+        1,
+        int(config["swiss_rounds"]) * int(config["swiss_openings"])
+        + int(config["mcmahon_rounds"]) * int(config["mcmahon_openings"]),
     )
-    needed_openings = max(1, rr_needed + h2h_needed)
     openings = load_or_create_openings(
         needed_openings,
         n_plies=args.plies,
@@ -651,7 +640,6 @@ def _load_tournament_openings(args, weight_paths, config):
         return None
 
     print(f"Tournament openings pool: {len(openings)} positions")
-    print("Ratings: transient (not writing to persistent glicko2 file)")
     print()
     return openings
 
@@ -665,94 +653,77 @@ def _print_gpu_status_local():
         print("No GPU detected — eval will be slow.")
 
 
-def _resolve_tournament_contenders(
-    model_a,
-    model_b,
-    weight_paths,
-    openings,
-    run_match_fn,
-    eval_batch_size,
-    config,
-):
-    if len(weight_paths) == 2:
-        print("\nTwo-player tournament: skipping round robin.")
-        return weight_paths, 0
-
-    rr = _run_round_robin_to_find_contenders(
-        model_a=model_a,
-        model_b=model_b,
-        weight_paths=weight_paths,
-        openings=openings,
-        run_match_fn=run_match_fn,
-        eval_batch_size=eval_batch_size,
-        config=config,
-    )
-
-    contenders = rr["contenders"]
-    print("\nRound-robin result:")
-    print(f"  Rounds played: {rr['rounds_played']}")
-    print(f"  Confident top-2: {'yes' if rr['confident'] else 'no (using best-rated top-2)'}")
-    print(f"  Contenders: {os.path.basename(contenders[0])} vs "
-          f"{os.path.basename(contenders[1])}")
-    return contenders, rr["opening_cursor"]
-
-
-def _print_heads_up_config(config):
-    print("\nHeads-up final configuration:")
-    for sims, n_batches in config["h2h_phases"]:
-        n_games = n_batches * config["h2h_openings_per_batch"] * 2
-        print(f"  {sims} sims: up to {n_games} games")
-    print(f"  Glicko period size: {config['h2h_rating_period_games']} games")
-    print(f"  Confidence target: {100.0 * config['h2h_confidence_prob']:.1f}%")
-    print(f"  Minimum games before crowning: {config['h2h_min_games']}")
-    print(f"  RD target: <= {config['h2h_target_rd']:.1f}")
-    print(f"  Shared-gold band: 50/50 ± {100.0 * config['h2h_shared_gold_margin']:.1f}% "
-          f"(min {config['h2h_shared_gold_min_games']} games)")
+def _print_tournament_config(config):
+    print("Tournament format:")
+    print(f"  Swiss seeding:  {config['swiss_rounds']} rounds  "
+          f"@ {config['swiss_sims']} sims, {config['swiss_openings'] * 2} games/pairing")
+    print(f"  McMahon final:  {config['mcmahon_rounds']} rounds  "
+          f"@ {config['mcmahon_sims']} sims, {config['mcmahon_openings'] * 2} games/pairing")
+    print(f"  McMahon bar gap: {config['mcmahon_bar_gap']:.1f} rating points")
+    print(f"  McMahon field:   min {config['mcmahon_min_players']} / "
+          f"max {config['mcmahon_max_players']} players")
+    print(f"  Shared gold:     50/50 ± {100.0 * config['shared_gold_margin']:.1f}% "
+          f"(min {config['shared_gold_min_games']} games)")
     print()
 
 
-def _print_tournament_final(contenders, final, config):
-    left_name = os.path.basename(contenders[0])
-    right_name = os.path.basename(contenders[1])
+def _print_finalists(finalists, bar_rating, ratings_table):
+    print("\nMcMahon finalists:")
+    print(f"  Bar rating: {bar_rating:.1f}")
+    for i, path in enumerate(finalists, 1):
+        entry = get_glicko2_entry(ratings_table, path, create=True)
+        print(f"  {i:2d}. {os.path.basename(path):30s}  {format_glicko2_entry(entry)}")
+    print()
+
+
+def _print_tournament_final(final):
+    rows = final["rows"]
     print("=" * 60)
     print("Tournament final result")
     print("=" * 60)
-    if final.get("shared_gold"):
-        print(f"  Champions (shared gold): {left_name} and {right_name}")
-        print(f"  Match score: {left_name} {100.0 * final['score_left']:.1f}% "
-              f"over {final['total_games']} games")
+    if final["shared_gold"]:
+        left = final["shared_gold_paths"][0]
+        right = final["shared_gold_paths"][1]
+        print(f"  Champions (shared gold): {os.path.basename(left['path'])} "
+              f"and {os.path.basename(right['path'])}")
+        if final["top_two_prob"] is not None:
+            print(f"  Top-2 model win-prob split: "
+                  f"{100.0 * final['top_two_prob']:.1f}% / "
+                  f"{100.0 * (1.0 - final['top_two_prob']):.1f}%")
     else:
         winner = final["winner"]
-        runner_up = contenders[1] if winner == contenders[0] else contenders[0]
         print(f"  Champion: {os.path.basename(winner)}")
-        print(f"  Runner-up: {os.path.basename(runner_up)}")
-        print(f"  Confidence: {100.0 * final['confidence']:.1f}% "
-              f"({'confident' if final['confident'] else 'not fully confident at cap'})")
-    print(f"  Max RD: {final['max_rd']:.1f} "
-          f"({'target met' if final['max_rd'] <= config['h2h_target_rd'] else 'above target'})")
-    print(f"  Batches played: {final['batches_played']}")
-    print(f"  {left_name}: {format_glicko2_entry(final['left_entry'])}")
-    print(f"  {right_name}: {format_glicko2_entry(final['right_entry'])}")
+
+    print("\n  Final McMahon standings:")
+    shown = rows[: min(10, len(rows))]
+    for i, row in enumerate(shown, 1):
+        print(f"    {i:2d}. {os.path.basename(row['path']):30s}  "
+              f"score {row['score']:.1f}  gp {row['gp_rate']:.3f}  "
+              f"{format_glicko2_entry(row['entry'])}")
+    if len(rows) > len(shown):
+        print(f"    ... +{len(rows) - len(shown)} more")
 
 
 def run_tournament(args, run_match_fn, eval_batch_size, print_gpu_status_fn=None):
-    """Run best-of-best tournament over all weights in args.tournament_dir."""
+    """Run Swiss + McMahon tournament over all weights in args.tournament_dir."""
     config = _build_config(args)
     discovered = find_weight_files(args.tournament_dir)
     if len(discovered) < 2:
         print(f"Need at least two weights in {args.tournament_dir}; found {len(discovered)}")
-        return
+        return None
 
     _print_tournament_candidates(args.tournament_dir, discovered)
     model_probe = create_model()
     weight_paths = _resolve_compatible_weight_paths(model_probe, discovered)
     if not weight_paths:
-        return
+        return None
 
-    openings = _load_tournament_openings(args, weight_paths, config)
+    ratings_table = _load_ratings_table(config)
+    openings = _load_tournament_openings(args, config)
     if not openings:
-        return
+        return None
 
+    _print_tournament_config(config)
     if print_gpu_status_fn is None:
         _print_gpu_status_local()
     else:
@@ -760,34 +731,87 @@ def run_tournament(args, run_match_fn, eval_batch_size, print_gpu_status_fn=None
 
     model_a = model_probe
     model_b = create_model()
-    contenders, opening_cursor = _resolve_tournament_contenders(
-        model_a,
-        model_b,
-        weight_paths,
-        openings,
-        run_match_fn,
-        eval_batch_size,
-        config,
-    )
-    _print_heads_up_config(config)
+    for path in weight_paths:
+        get_glicko2_entry(ratings_table, path, create=True)
 
-    final = _run_heads_up_until_confident(
+    swiss = _run_pairing_stage(
         model_a=model_a,
         model_b=model_b,
-        left_path=contenders[0],
-        right_path=contenders[1],
+        stage_name="Swiss",
+        stage_tag="Swiss",
+        stage_paths=weight_paths,
         openings=openings,
-        opening_cursor=opening_cursor,
-        config=config,
+        opening_cursor=0,
+        rounds=config["swiss_rounds"],
+        sims=config["swiss_sims"],
+        openings_per_round=config["swiss_openings"],
         run_match_fn=run_match_fn,
         eval_batch_size=eval_batch_size,
+        ratings_table=ratings_table,
     )
-    _print_tournament_final(contenders, final, config)
+    ratings_table = swiss["ratings_table"]
+    _print_tourney_standings(ratings_table, weight_paths, limit=15)
+
+    finalists, bar_rating, _ = _select_mcmahon_finalists(weight_paths, ratings_table, config)
+    if len(finalists) < 2:
+        print("McMahon finalist selection produced fewer than two players.")
+        return None
+    _print_finalists(finalists, bar_rating, ratings_table)
+
+    finalist_set = set(finalists)
+    seeded_pairs = {
+        pair for pair in swiss["played_pairs"]
+        if pair[0] in finalist_set and pair[1] in finalist_set
+    }
+    mcmahon = _run_pairing_stage(
+        model_a=model_a,
+        model_b=model_b,
+        stage_name="McMahon",
+        stage_tag="McM",
+        stage_paths=finalists,
+        openings=openings,
+        opening_cursor=swiss["opening_cursor"],
+        rounds=config["mcmahon_rounds"],
+        sims=config["mcmahon_sims"],
+        openings_per_round=config["mcmahon_openings"],
+        run_match_fn=run_match_fn,
+        eval_batch_size=eval_batch_size,
+        ratings_table=ratings_table,
+        seed_played_pairs=seeded_pairs,
+    )
+
+    mc_rows = _stage_rows(finalists, mcmahon["stats"], ratings_table)
+    final = _resolve_mcmahon_result(mc_rows, ratings_table, config)
+    final["bar_rating"] = bar_rating
+    final["finalists"] = finalists
+    final["swiss_rounds_played"] = swiss["rounds_played"]
+    final["mcmahon_rounds_played"] = mcmahon["rounds_played"]
+    _print_tournament_final(final)
+    _save_ratings_table_if_enabled(config, ratings_table)
+
+    promoted_path = None
+    best_state = None
+    if config["promote_winner"]:
+        promoted_path, reason = _pick_promoted_winner(final)
+        if promoted_path:
+            best_state = _write_best_checkpoint(config, promoted_path, ratings_table)
+            print(f"Best checkpoint updated ({reason}) -> {promoted_path}")
+            print(f"  Best weights: {config['best_weights_file']}")
+            print(f"  Best state:   {config['best_state_file']}")
+        else:
+            print("Best checkpoint not updated (no champion resolved).")
+
+    return {
+        "final": final,
+        "ratings_table": ratings_table,
+        "promoted_path": promoted_path,
+        "best_state": best_state,
+    }
 
 
 def _build_tournament_parser():
     parser = argparse.ArgumentParser(
-        description="Run best-of-best tournament over all weight files in a directory."
+        description="Run Swiss + McMahon tournament over all weight files in a directory."
     )
     parser.add_argument("--tournament-dir", type=str, required=True,
                         help="Directory with checkpoint weights")
@@ -795,14 +819,60 @@ def _build_tournament_parser():
                         help=f"Opening RNG seed (default: {EVAL_OPENING_SEED})")
     parser.add_argument("--plies", type=int, default=EVAL_OPENING_PLIES,
                         help=f"Random plies per opening (default: {EVAL_OPENING_PLIES})")
+
+    parser.add_argument("--swiss-rounds", type=int, default=TOURNEY_SWISS_ROUNDS,
+                        help=f"Swiss seeding rounds (default: {TOURNEY_SWISS_ROUNDS})")
+    parser.add_argument("--swiss-sims", type=int, default=TOURNEY_SWISS_SIMS,
+                        help=f"Swiss sims per move (default: {TOURNEY_SWISS_SIMS})")
+    parser.add_argument("--swiss-openings", type=int, default=TOURNEY_SWISS_OPENINGS,
+                        help=f"Swiss openings per round "
+                             f"(default: {TOURNEY_SWISS_OPENINGS})")
+
+    parser.add_argument("--mcmahon-rounds", type=int, default=TOURNEY_MCM_ROUNDS,
+                        help=f"McMahon rounds (default: {TOURNEY_MCM_ROUNDS})")
+    parser.add_argument("--mcmahon-sims", type=int, default=TOURNEY_MCM_SIMS,
+                        help=f"McMahon sims per move (default: {TOURNEY_MCM_SIMS})")
+    parser.add_argument("--mcmahon-openings", type=int, default=TOURNEY_MCM_OPENINGS,
+                        help=f"McMahon openings per round "
+                             f"(default: {TOURNEY_MCM_OPENINGS})")
+    parser.add_argument("--mcmahon-bar-gap", type=float, default=TOURNEY_MCM_BAR_GAP,
+                        help=f"Bar gap from leader rating "
+                             f"(default: {TOURNEY_MCM_BAR_GAP:.1f})")
+    parser.add_argument("--mcmahon-min-players", type=int, default=TOURNEY_MCM_MIN_PLAYERS,
+                        help=f"Minimum McMahon finalists "
+                             f"(default: {TOURNEY_MCM_MIN_PLAYERS})")
+    parser.add_argument("--mcmahon-max-players", type=int, default=TOURNEY_MCM_MAX_PLAYERS,
+                        help=f"Maximum McMahon finalists "
+                             f"(default: {TOURNEY_MCM_MAX_PLAYERS})")
+
     parser.add_argument("--shared-gold-margin", type=float,
-                        default=TOURNEY_H2H_SHARED_GOLD_MARGIN,
+                        default=TOURNEY_SHARED_GOLD_MARGIN,
                         help=f"Practical tie band around 50/50 "
-                             f"(default: {TOURNEY_H2H_SHARED_GOLD_MARGIN:.2f})")
+                             f"(default: {TOURNEY_SHARED_GOLD_MARGIN:.2f})")
     parser.add_argument("--shared-gold-min-games", type=int,
-                        default=TOURNEY_H2H_SHARED_GOLD_MIN_GAMES,
+                        default=TOURNEY_SHARED_GOLD_MIN_GAMES,
                         help=f"Minimum games before shared-gold tie "
-                             f"(default: {TOURNEY_H2H_SHARED_GOLD_MIN_GAMES})")
+                             f"(default: {TOURNEY_SHARED_GOLD_MIN_GAMES})")
+
+    parser.add_argument("--persist-ratings", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Load and save persistent Glicko-2 ratings "
+                             "(default: enabled)")
+    parser.add_argument("--ratings-file", type=str, default=None,
+                        help="Persistent ratings file "
+                             "(default: <tournament-dir>/glicko2_ratings.pkl)")
+    parser.add_argument("--promote-winner", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Update best checkpoint files from tournament winner "
+                             "(default: enabled)")
+    parser.add_argument("--best-weights-file", type=str,
+                        default=None,
+                        help="Output path for best weights copy "
+                             "(default: <tournament-dir>/gomoku_best.weights.h5)")
+    parser.add_argument("--best-state-file", type=str,
+                        default=None,
+                        help="Output path for persisted best-state metadata "
+                             "(default: <tournament-dir>/best_checkpoint.pkl)")
     return parser
 
 

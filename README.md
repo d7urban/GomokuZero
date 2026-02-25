@@ -52,7 +52,8 @@ Training parameters can be adjusted in `train.py`. The script will:
 - Generate self-play games using batched MCTS
 - Train the network on policy and value targets
 - Save checkpoints to `weights/`
-- Evaluate new checkpoints against previous versions
+- Keep plateau/autotune safeguards in-loop (inline eval/promotion disabled by default)
+- Hand off checkpoint ranking/promotion to manual tournament runs
 
 ### Evaluation
 
@@ -72,18 +73,35 @@ python eval.py --openings 200
 python eval.py --checkpoint weights/gomoku_best.weights.h5 --calibrate-sims --sim-levels 100,400,1600
 
 # Run tournament across all weight files in a folder
+# (Swiss seeding -> McMahon final, no heads-up)
 python eval_tournament.py --tournament-dir botb-weights
 
 # Tournament with practical-tie (shared-gold) settings
 python eval_tournament.py --tournament-dir botb-weights --shared-gold-margin 0.02 --shared-gold-min-games 120
 
+# Large field example (hundreds of checkpoints)
+python eval_tournament.py --tournament-dir botb-weights --swiss-rounds 6 --mcmahon-rounds 5 --mcmahon-max-players 24
+
+# Tournament without touching persistent ratings / best checkpoint files
+python eval_tournament.py --tournament-dir botb-weights --no-persist-ratings --no-promote-winner
+
 # Run eval without changing persistent ratings
 python eval.py --no-rating-update
+
+# Pretty-print a ratings table
+python ratings_glicko2.py Mixed-competitor-weights/glicko2_ratings.pkl
+python ratings_glicko2.py Mixed-competitor-weights/glicko2_ratings.pkl --min-games 40 --sort games
 ```
 
 Standard eval runs update persistent Glicko-2 ratings in `weights/glicko2_ratings.pkl`.
-Tournament mode uses transient in-memory ratings and does not write that file.
-`eval.py --tournament-dir ...` is still supported as a compatibility wrapper.
+Tournament mode (`eval_tournament.py`) is persistent by default. It runs Swiss
+seeding across all checkpoints, then a McMahon final group selected by rating
+bar, and writes outputs inside the tournament folder by default:
+`<tournament-dir>/glicko2_ratings.pkl`,
+`<tournament-dir>/gomoku_best.weights.h5`,
+`<tournament-dir>/best_checkpoint.pkl`.
+Use `--no-persist-ratings --no-promote-winner` for dry-run/transient behavior.
+`eval.py --tournament-dir ...` remains supported as a compatibility wrapper.
 
 ### Playing
 
@@ -154,9 +172,9 @@ python play_qt.py
 ## Files
 
 - `gomoku.py` - Core game logic, neural network, and MCTS implementation
-- `train.py` - Self-play training loop with inline evaluation
+- `train.py` - Self-play training loop (inline eval/promotion disabled by default)
 - `eval.py` - Checkpoint evaluation, calibration, and persistent Glicko-2 updates
-- `eval_tournament.py` - Tournament runner (round-robin + heads-up final with shared-gold tie handling)
+- `eval_tournament.py` - Swiss + McMahon tournament runner with persistent ratings and best-checkpoint promotion
 - `play.py` - Interactive terminal UI for human vs AI
 - `play_qt.py` - PyQt6 graphical UI (human vs AI / human vs human, analysis heatmap)
 - `book_openings.py` - Opening book for evaluation consistency

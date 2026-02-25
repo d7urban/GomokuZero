@@ -5,10 +5,12 @@ Glicko-2 rating math and persistence helpers.
 Shared by eval.py and train.py.
 """
 
+import argparse
 import math
 import os
 import pickle
 import time
+from datetime import datetime
 
 GLICKO2_RATINGS_FILE = "weights/glicko2_ratings.pkl"
 
@@ -21,12 +23,26 @@ GLICKO2_SCALE = 173.7178
 
 
 def _normalize_rating_key(checkpoint_path):
-    return os.path.normpath(checkpoint_path)
+    if not checkpoint_path:
+        return None
+    if isinstance(checkpoint_path, str) and checkpoint_path.startswith(("ino:", "path:")):
+        return checkpoint_path
+    path = os.path.normpath(str(checkpoint_path))
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return f"ino:{int(st.st_dev)}:{int(st.st_ino)}"
 
 
-def _new_glicko2_entry(checkpoint_path):
+def _path_fallback_key(checkpoint_path):
+    return f"path:{os.path.normpath(str(checkpoint_path))}"
+
+
+def _new_glicko2_entry(checkpoint_path, rating_key):
     return {
-        "checkpoint_path": _normalize_rating_key(checkpoint_path),
+        "checkpoint_path": os.path.normpath(str(checkpoint_path)),
+        "rating_key": rating_key,
         "rating": float(GLICKO2_RATING0),
         "rd": float(GLICKO2_RD0),
         "vol": float(GLICKO2_VOL0),
@@ -36,13 +52,78 @@ def _new_glicko2_entry(checkpoint_path):
     }
 
 
+def _merge_glicko2_entries(left, right):
+    """Merge duplicate entries that resolve to the same rating key."""
+    l_periods = int(left.get("periods", 0))
+    r_periods = int(right.get("periods", 0))
+    if r_periods > l_periods:
+        left, right = right, left
+    merged = dict(left)
+    merged["games"] = max(int(left.get("games", 0)), int(right.get("games", 0)))
+    merged["periods"] = max(l_periods, r_periods)
+    merged["updated_unix"] = max(
+        int(left.get("updated_unix", 0)),
+        int(right.get("updated_unix", 0)),
+    )
+    return merged
+
+
+def _migrate_rating_table_keys(table):
+    migrated = {}
+    changed = False
+    for old_key, entry in table.items():
+        if not isinstance(entry, dict):
+            changed = True
+            continue
+
+        checkpoint_path = entry.get("checkpoint_path")
+        if checkpoint_path:
+            checkpoint_path = os.path.normpath(str(checkpoint_path))
+        else:
+            checkpoint_path = None
+
+        new_key = None
+        if isinstance(old_key, str) and old_key.startswith("ino:"):
+            new_key = old_key
+        elif checkpoint_path:
+            new_key = _normalize_rating_key(checkpoint_path)
+        elif isinstance(old_key, str) and old_key.startswith("path:"):
+            new_key = _normalize_rating_key(old_key[5:])
+        elif isinstance(old_key, str):
+            new_key = _normalize_rating_key(old_key)
+
+        if new_key is None:
+            if checkpoint_path:
+                new_key = _path_fallback_key(checkpoint_path)
+            elif isinstance(old_key, str):
+                new_key = old_key if old_key.startswith("path:") else f"path:{old_key}"
+            else:
+                new_key = str(old_key)
+
+        row = dict(entry)
+        if checkpoint_path:
+            row["checkpoint_path"] = checkpoint_path
+        row["rating_key"] = new_key
+
+        if new_key in migrated:
+            migrated[new_key] = _merge_glicko2_entries(migrated[new_key], row)
+            changed = True
+        else:
+            migrated[new_key] = row
+        if new_key != old_key:
+            changed = True
+
+    return migrated, changed
+
+
 def load_glicko2_ratings(path=GLICKO2_RATINGS_FILE):
     if os.path.exists(path):
         try:
             with open(path, "rb") as f:
                 table = pickle.load(f)
             if isinstance(table, dict):
-                return table
+                migrated, _ = _migrate_rating_table_keys(table)
+                return migrated
         except Exception:
             pass
     return {}
@@ -57,11 +138,57 @@ def save_glicko2_ratings(table, path=GLICKO2_RATINGS_FILE):
 def get_glicko2_entry(table, checkpoint_path, create=True):
     if not checkpoint_path:
         return None
-    key = _normalize_rating_key(checkpoint_path)
+    direct_key = (
+        checkpoint_path
+        if isinstance(checkpoint_path, str) and checkpoint_path.startswith(("ino:", "path:"))
+        else None
+    )
+    key = _normalize_rating_key(checkpoint_path) if direct_key is None else direct_key
     entry = table.get(key)
+    if entry is None and direct_key is None:
+        path_norm = os.path.normpath(str(checkpoint_path))
+        legacy_key = path_norm
+        if legacy_key in table:
+            entry = table[legacy_key]
+            if key is not None:
+                table.pop(legacy_key, None)
+                table[key] = entry
+            else:
+                key = legacy_key
+        elif _path_fallback_key(path_norm) in table:
+            old_key = _path_fallback_key(path_norm)
+            entry = table[old_key]
+            if key is not None:
+                table.pop(old_key, None)
+                table[key] = entry
+            else:
+                key = old_key
+
+    if entry is None and direct_key is None:
+        base = os.path.basename(os.path.normpath(str(checkpoint_path)))
+        matches = []
+        for k, v in table.items():
+            if not isinstance(v, dict):
+                continue
+            cp = v.get("checkpoint_path")
+            if cp and os.path.basename(str(cp)) == base:
+                matches.append(k)
+        if len(matches) == 1:
+            old_key = matches[0]
+            entry = table[old_key]
+            if key is not None and old_key != key:
+                table[key] = table.pop(old_key)
+                entry = table[key]
+
     if entry is None and create:
-        entry = _new_glicko2_entry(key)
+        if key is None:
+            key = _path_fallback_key(checkpoint_path)
+        entry = _new_glicko2_entry(checkpoint_path, key)
         table[key] = entry
+    if entry is not None and direct_key is None:
+        entry["checkpoint_path"] = os.path.normpath(str(checkpoint_path))
+    if entry is not None and key is not None:
+        entry["rating_key"] = key
     return entry
 
 
@@ -204,14 +331,21 @@ def apply_match_glicko2_update(table, candidate_path, opponent_path,
     """Apply one match period update for both sides using stored ratings."""
     if not candidate_path or not opponent_path:
         return None
-    cand_key = _normalize_rating_key(candidate_path)
-    opp_key = _normalize_rating_key(opponent_path)
-    if cand_key == opp_key:
-        return None
-
-    cand = get_glicko2_entry(table, cand_key, create=True)
-    opp = get_glicko2_entry(table, opp_key, create=True)
+    cand = get_glicko2_entry(table, candidate_path, create=True)
+    opp = get_glicko2_entry(table, opponent_path, create=True)
     if cand is None or opp is None:
+        return None
+    cand_key = cand.get("rating_key") or _normalize_rating_key(candidate_path)
+    opp_key = opp.get("rating_key") or _normalize_rating_key(opponent_path)
+    if not cand_key:
+        cand_key = _path_fallback_key(candidate_path)
+        cand["rating_key"] = cand_key
+        table[cand_key] = cand
+    if not opp_key:
+        opp_key = _path_fallback_key(opponent_path)
+        opp["rating_key"] = opp_key
+        table[opp_key] = opp
+    if cand_key == opp_key:
         return None
 
     total = int(wins + losses + draws)
@@ -264,3 +398,194 @@ def glicko2_pairwise_win_prob(entry_a, entry_b):
     sigma = math.sqrt(rda * rda + rdb * rdb)
     z = (ra - rb) / sigma
     return min(1.0, max(0.0, _normal_cdf(z)))
+
+
+def _rating_row_from_entry(key, entry, full_path=False):
+    checkpoint_path = entry.get("checkpoint_path")
+    if checkpoint_path:
+        display_path = os.path.normpath(str(checkpoint_path))
+    elif isinstance(key, str) and key.startswith("path:"):
+        display_path = os.path.normpath(key[5:])
+    else:
+        display_path = str(key)
+
+    rating = float(entry.get("rating", GLICKO2_RATING0))
+    rd = float(entry.get("rd", GLICKO2_RD0))
+    games = int(entry.get("games", 0))
+    periods = int(entry.get("periods", 0))
+    updated_unix = int(entry.get("updated_unix", 0))
+
+    return {
+        "key": str(key),
+        "path": display_path,
+        "name": display_path if full_path else os.path.basename(display_path),
+        "rating": rating,
+        "rd": rd,
+        "ci95": 2.0 * rd,
+        "games": games,
+        "periods": periods,
+        "updated_unix": updated_unix,
+    }
+
+
+def _sorted_rating_rows(table, sort_by="rating", full_path=False):
+    rows = []
+    for key, entry in table.items():
+        if not isinstance(entry, dict):
+            continue
+        rows.append(_rating_row_from_entry(key, entry, full_path=full_path))
+
+    if sort_by == "rd":
+        rows.sort(key=lambda r: (
+            r["rd"],
+            -r["rating"],
+            -r["games"],
+            r["name"].lower(),
+        ))
+        return rows
+    if sort_by == "games":
+        rows.sort(key=lambda r: (
+            -r["games"],
+            -r["rating"],
+            r["rd"],
+            r["name"].lower(),
+        ))
+        return rows
+    if sort_by == "updated":
+        rows.sort(key=lambda r: (
+            -r["updated_unix"],
+            -r["rating"],
+            r["rd"],
+            r["name"].lower(),
+        ))
+        return rows
+
+    rows.sort(key=lambda r: (
+        -r["rating"],
+        r["rd"],
+        -r["games"],
+        r["name"].lower(),
+    ))
+    return rows
+
+
+def _format_updated(updated_unix):
+    if updated_unix <= 0:
+        return "-"
+    return datetime.fromtimestamp(updated_unix).strftime("%Y-%m-%d %H:%M")
+
+
+def _print_ratings_table(rows, limit=None, show_key=False):
+    if not rows:
+        print("No rating entries found.")
+        return
+
+    if limit is not None and limit > 0:
+        shown = rows[:limit]
+    else:
+        shown = rows
+
+    def _fmt_float(x):
+        ax = abs(float(x))
+        if ax >= 1e6 or (ax > 0 and ax < 1e-3):
+            return f"{x:.3e}"
+        return f"{x:.1f}"
+
+    for row in shown:
+        row["rating_s"] = _fmt_float(row["rating"])
+        row["rd_s"] = _fmt_float(row["rd"])
+        row["ci95_s"] = _fmt_float(row["ci95"])
+
+    name_w = max(20, min(52, max(len(r["name"]) for r in shown)))
+    rating_w = max(7, max(len(r["rating_s"]) for r in shown))
+    rd_w = max(6, max(len(r["rd_s"]) for r in shown))
+    ci95_w = max(6, max(len(r["ci95_s"]) for r in shown))
+    header = (
+        f"{'#':>3}  {'checkpoint':<{name_w}}  {'R':>{rating_w}}  {'RD':>{rd_w}}  "
+        f"{'95%':>{ci95_w}}  {'games':>7}  {'periods':>7}  {'updated':<16}"
+    )
+    if show_key:
+        header += "  key"
+    print(header)
+    print("-" * len(header))
+    for idx, row in enumerate(shown, 1):
+        line = (
+            f"{idx:>3d}  {row['name']:<{name_w}}  "
+            f"{row['rating_s']:>{rating_w}}  {row['rd_s']:>{rd_w}}  "
+            f"{row['ci95_s']:>{ci95_w}}  "
+            f"{row['games']:>7d}  {row['periods']:>7d}  "
+            f"{_format_updated(row['updated_unix']):<16}"
+        )
+        if show_key:
+            line += f"  {row['key']}"
+        print(line)
+    if len(shown) < len(rows):
+        print(f"... showing {len(shown)} of {len(rows)} entries")
+
+
+def _build_ratings_printer_parser():
+    parser = argparse.ArgumentParser(
+        description="Pretty-print a Glicko-2 ratings table."
+    )
+    parser.add_argument(
+        "ratings_file",
+        nargs="?",
+        default=GLICKO2_RATINGS_FILE,
+        help=f"Ratings pickle file (default: {GLICKO2_RATINGS_FILE})",
+    )
+    parser.add_argument(
+        "--sort",
+        choices=("rating", "rd", "games", "updated"),
+        default="rating",
+        help="Sort order (default: rating)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Max rows to print (<=0 means all, default: 50)",
+    )
+    parser.add_argument(
+        "--min-games",
+        type=int,
+        default=0,
+        help="Hide entries with fewer games (default: 0)",
+    )
+    parser.add_argument(
+        "--full-path",
+        action="store_true",
+        help="Show full checkpoint paths instead of basenames",
+    )
+    parser.add_argument(
+        "--show-key",
+        action="store_true",
+        help="Show internal rating key column",
+    )
+    return parser
+
+
+def _run_ratings_printer_cli():
+    parser = _build_ratings_printer_parser()
+    args = parser.parse_args()
+
+    ratings_file = os.path.normpath(args.ratings_file)
+    if not os.path.exists(ratings_file):
+        print(f"Ratings file not found: {ratings_file}")
+        return 1
+
+    table = load_glicko2_ratings(ratings_file)
+    rows = _sorted_rating_rows(table, sort_by=args.sort, full_path=args.full_path)
+    min_games = max(0, int(args.min_games))
+    if min_games > 0:
+        rows = [r for r in rows if r["games"] >= min_games]
+
+    print(f"Ratings file: {ratings_file}")
+    print(f"Entries: {len(rows)} (filtered by min-games >= {min_games})")
+    print()
+    limit = int(args.limit)
+    _print_ratings_table(rows, limit=limit if limit > 0 else None, show_key=args.show_key)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_ratings_printer_cli())

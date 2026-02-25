@@ -20,7 +20,7 @@ Usage:
     python eval.py --checkpoint weights/gomoku_best.weights.h5 \
         --calibrate-sims --sim-levels 100,400,1600
 
-    # Run a best-of-best tournament over all weights in a folder:
+    # Run Swiss+McMahon tournament over all weights in a folder:
     python eval.py --tournament-dir botb-weights
 """
 
@@ -346,7 +346,7 @@ def _print_eval_gpu_status():
 
 
 def run_tournament(args):
-    """Best-of-best tournament mode over all weights in a folder."""
+    """Swiss + McMahon tournament mode over all weights in a folder."""
     from eval_tournament import run_tournament as run_tournament_impl
 
     run_tournament_impl(

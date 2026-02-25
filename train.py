@@ -50,7 +50,7 @@ from ratings_glicko2 import (
 
 # ── Tunables ────────────────────────────────────────────────────────────────
 CONCURRENT_GAMES  = 20           # games interleaved on GPU simultaneously
-NUM_GAMES         = 70000         # total self-play games
+NUM_GAMES         = 10000         # total self-play games
 C_PUCT            = 1.5
 DIRICHLET_ALPHA   = 0.15
 NOISE_FRAC_START  = 0.35         # Dirichlet noise fraction (anneals down)
@@ -65,7 +65,7 @@ TRAIN_STEPS_RATIO = 4.0          # gradient steps = new_positions * ratio / BATC
 LR                = 1e-3
 WEIGHT_DECAY      = 1e-4
 VALUE_LOSS_COEFF  = 1.0          # weight on value loss (tune if v-loss dominates)
-SAVE_INTERVAL     = 750          # games between checkpoint saves
+SAVE_INTERVAL     = 500          # games between checkpoint saves
 EVAL_INTERVAL     = 200          # games between diagnostic/promotion checks
 
 # Batched MCTS — leaves evaluated per forward pass.
@@ -135,6 +135,7 @@ PROMOTE_WHITE_QUICK_LOSS_MIN_LOSSES = 10  # apply quick-loss gate only with enou
 PROMOTE_WHITE_QUICK_LOSS_CHECK_NON_LOSS_MAX = 0.50  # apply quick-loss only if White non-loss is weak
 EMERG_LR_FACTOR       = 0.3     # multiply LR by this on emergency
 EMERG_LR_MIN_GAMES    = 1000    # don't fire emergency before this many games
+INLINE_EVAL_PROMOTION_ENABLED = False  # run manual eval_tournament.py after training chunks
 
 # Plateau auto-tuning (conservative, reversible in-run controls only)
 PLATEAU_AUTOTUNE_ENABLED = True
@@ -922,6 +923,22 @@ def _update_interleaved_soft_resign(game_state, root, is_best_turn):
         game_state.soft_resigned = True
 
 
+def _interleaved_winner_from_reward(game, reward):
+    if reward == 1:
+        return game.current_player
+    if reward == -1:
+        return -game.current_player
+    return 0
+
+
+def _set_interleaved_post_move_state(game_state, reward, done):
+    if done:
+        game_state.winner = _interleaved_winner_from_reward(game_state.game, reward)
+        game_state.finished = True
+        return
+    game_state.phase = "new_move"
+
+
 def _apply_interleaved_action(game_state, root, pi):
     row, col = select_action(pi)
     assert game_state.game.board[row, col] == 0, (
@@ -933,14 +950,7 @@ def _apply_interleaved_action(game_state, root, pi):
 
     reward, done = game_state.game.make_move(row, col)
     game_state.move_num += 1
-    if done:
-        if reward == 1:
-            game_state.winner = game_state.game.current_player
-        elif reward == -1:
-            game_state.winner = -game_state.game.current_player
-        game_state.finished = True
-    else:
-        game_state.phase = "new_move"
+    _set_interleaved_post_move_state(game_state, reward, done)
 
 
 def _advance_interleaved_completed_games(active_games):
@@ -1143,26 +1153,6 @@ def _resolve_promotion_checkpoint_file(model, game_count, glicko2_table):
     return cp_file
 
 
-def _auto_promote_if_no_best(model, game_count, cp_file, glicko2_table):
-    if os.path.exists(BEST_WEIGHTS_FILE):
-        return None, cp_file
-
-    if cp_file is None:
-        cp_file = _save_timestamped_checkpoint(model, game_count)
-    shutil.copy2(cp_file, BEST_WEIGHTS_FILE)
-    best_state = {
-        "path": cp_file,
-        "game_count": game_count,
-        "glicko2_vs_long": None,
-    }
-    if glicko2_table is not None:
-        get_glicko2_entry(glicko2_table, cp_file, create=True)
-        save_glicko2_ratings(glicko2_table)
-    _save_best_state(best_state)
-    print("  ★ Auto-promoted to best (no previous best)", flush=True)
-    return best_state, cp_file
-
-
 def _run_promotion_match(model, game_count, all_openings, best_gc, opp_model):
     eval_openings = _sample_eval_openings(
         all_openings, PROMOTE_EVAL_OPENINGS, seed=game_count
@@ -1340,14 +1330,13 @@ def _run_promotion_eval(model, game_count, all_openings, best_state, opp_model,
       - White: must not collapse defensively
         (minimum non-loss rate, bounded quick-loss rate, and wins or survival).
     """
+    if not best_state.get("path") or not os.path.exists(BEST_WEIGHTS_FILE):
+        print("  Promotion eval skipped: no best checkpoint file. "
+              "Run eval_tournament.py first.", flush=True)
+        return best_state
+
     best_gc = best_state.get("game_count", 0)
     cp_file = _resolve_promotion_checkpoint_file(model, game_count, glicko2_table)
-
-    auto_promoted_state, cp_file = _auto_promote_if_no_best(
-        model, game_count, cp_file, glicko2_table
-    )
-    if auto_promoted_state is not None:
-        return auto_promoted_state
 
     result = _run_promotion_match(
         model, game_count, all_openings, best_gc, opp_model
@@ -1445,11 +1434,16 @@ def _setup_training_run():
     else:
         print("Threat planes: numpy fallback (~150μs, rebuild Cython or pip install numba)")
     print(f"Checkpoints: save every {SAVE_INTERVAL}g")
-    print(f"Eval: diagnostic every {EVAL_INTERVAL}g ({DIAG_EVAL_SIMS} sims), "
-          f"promotion trigger: {PROMOTE_DIAG_MIN_STRONG} strong checks in rolling "
-          f"{PROMOTE_DIAG_WINDOW} (arm immediately) with "
-          f"Black lower>{PROMOTE_DIAG_BLACK_LOWER:.0%} "
-          f"({PROMOTE_EVAL_SIMS} sims, per-color Wilson CI)")
+    if INLINE_EVAL_PROMOTION_ENABLED:
+        print(f"Eval: diagnostic every {EVAL_INTERVAL}g ({DIAG_EVAL_SIMS} sims), "
+              f"promotion trigger: {PROMOTE_DIAG_MIN_STRONG} strong checks in rolling "
+              f"{PROMOTE_DIAG_WINDOW} (arm immediately) with "
+              f"Black lower>{PROMOTE_DIAG_BLACK_LOWER:.0%} "
+              f"({PROMOTE_EVAL_SIMS} sims, per-color Wilson CI)")
+    else:
+        print("Eval: inline diagnostic/promotion disabled")
+        print("      Run manual tournament after run/chunk, e.g.:")
+        print("      python eval_tournament.py --tournament-dir weights")
     print(f"Concurrent games: {CONCURRENT_GAMES}, target: {NUM_GAMES}")
     print(f"Best-opponent: {BEST_PLAY_FRAC:.0%} of games vs best checkpoint")
     print(f"Noise: {NOISE_FRAC_START:.2f}→{NOISE_FRAC_END:.2f} over {NOISE_DECAY_GAMES}g")
@@ -1502,7 +1496,7 @@ def _setup_training_run():
         rating_str = format_glicko2_entry(best_entry) if best_entry else "unrated"
         print(f"Current best: g{best_state['game_count']:05d} ({rating_str})")
     else:
-        print("No best checkpoint yet — first promotion after initial evals.")
+        print("No best checkpoint yet — run eval_tournament.py to create one.")
 
     # Reusable opponent model for eval (swap weights per matchup)
     opp_model = create_model()
@@ -1519,7 +1513,7 @@ def _setup_training_run():
         print(f"Best-opponent loaded from {BEST_WEIGHTS_FILE} "
               f"(g{best_state.get('game_count', '?')})")
     else:
-        print("No best checkpoint — vs-best games disabled until first promotion")
+        print("No best checkpoint — vs-best games disabled until tournament promotion")
     print()
 
     game_count = starting_game
@@ -1827,23 +1821,6 @@ def _maybe_save_checkpoint(
     )
     print(f"  → Checkpoint {cp_file}", flush=True)
 
-    if os.path.exists(BEST_WEIGHTS_FILE):
-        return
-
-    shutil.copy2(cp_file, BEST_WEIGHTS_FILE)
-    state["best_state"] = {
-        "path": cp_file,
-        "game_count": game_count,
-        "glicko2_vs_long": None,
-    }
-    get_glicko2_entry(glicko2_table, cp_file, create=True)
-    save_glicko2_ratings(glicko2_table)
-    _save_best_state(state["best_state"])
-    state["best_model"], state["best_predict_fn"] = _load_best_predict_fn(
-        state["best_model"]
-    )
-    print(f"  ★ Auto-promoted g{game_count} as first best", flush=True)
-
 
 def _diag_eval_signal(model, game_count, full_openings, opp_model, diag_strong_history):
     diag_openings = _sample_eval_openings(
@@ -2089,16 +2066,17 @@ def _run_iteration_scheduled_tasks(loop_ctx, state, game_count, prev_game_count)
         game_count,
         prev_game_count,
     )
-    _maybe_run_eval_tick(
-        state,
-        model,
-        game_count,
-        full_openings,
-        opp_model,
-        lr_scheduler,
-        glicko2_table,
-        prev_game_count,
-    )
+    if INLINE_EVAL_PROMOTION_ENABLED:
+        _maybe_run_eval_tick(
+            state,
+            model,
+            game_count,
+            full_openings,
+            opp_model,
+            lr_scheduler,
+            glicko2_table,
+            prev_game_count,
+        )
 
 
 def _run_training_iteration(loop_ctx, state):
