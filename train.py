@@ -45,7 +45,7 @@ from eval import (
 
 # ── Tunables ────────────────────────────────────────────────────────────────
 CONCURRENT_GAMES  = 16           # games interleaved on GPU simultaneously
-NUM_GAMES         = 10000         # total self-play games
+NUM_GAMES         = 70000         # total self-play games
 C_PUCT            = 1.5
 DIRICHLET_ALPHA   = 0.15
 NOISE_FRAC_START  = 0.35         # Dirichlet noise fraction (anneals down)
