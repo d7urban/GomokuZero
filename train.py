@@ -16,11 +16,10 @@ Architecture: single-process, GPU-accelerated.
 
 import numpy as np
 import math
-import os, pickle, time, glob, signal, shutil
+import os, pickle, time, signal, shutil
 from datetime import datetime
 from collections import deque
 
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 import tensorflow as tf
 from tensorflow import keras
@@ -31,7 +30,7 @@ _gpus = tf.config.list_physical_devices("GPU")
 
 from gomoku import (
     BOARD_SIZE, PLAYER1, NUM_INPUT_PLANES,
-    GomokuGame, create_model, encode_state, make_predict_fn,
+    GomokuGame, create_model, make_predict_fn,
     mcts_policy, select_action,
     mcts_begin, mcts_expand_root, mcts_select_leaves, mcts_process_results,
 )
@@ -663,7 +662,7 @@ def _set_optimizer_state(optimizer, state):
     if hasattr(optimizer, "set_weights"):
         optimizer.set_weights(state)
     else:
-        for var, val in zip(optimizer.variables, state):
+        for var, val in zip(optimizer.variables, state, strict=False):
             var.assign(val)
 
 
@@ -720,7 +719,7 @@ def _load_training_state(model, optimizer, replay):
                 dummy_v = np.zeros((1,), dtype=np.float32)
                 dummy_w = np.ones((1,), dtype=np.float32)
                 _train_step(model, optimizer, dummy_s, dummy_p, dummy_v, dummy_w)
-                for var, w in zip(model.trainable_variables, saved_w):
+                for var, w in zip(model.trainable_variables, saved_w, strict=False):
                     var.assign(w)
                 try:
                     _set_optimizer_state(optimizer, opt_weights)
@@ -1014,7 +1013,7 @@ def _train_step(model, optimizer, states, target_pi, target_v, pi_weights):
 
     grads = tape.gradient(loss, model.trainable_variables)
     grads, _ = tf.clip_by_global_norm(grads, 5.0)
-    optimizer.apply_gradients(zip(grads, model.trainable_variables))
+    optimizer.apply_gradients(zip(grads, model.trainable_variables, strict=False))
     return policy_loss, value_loss, loss
 
 
@@ -1520,7 +1519,7 @@ def _setup_training_run():
         print(f"Best-opponent loaded from {BEST_WEIGHTS_FILE} "
               f"(g{best_state.get('game_count', '?')})")
     else:
-        print(f"No best checkpoint — vs-best games disabled until first promotion")
+        print("No best checkpoint — vs-best games disabled until first promotion")
     print()
 
     game_count = starting_game

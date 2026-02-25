@@ -7,14 +7,13 @@ The AI uses MCTS with the trained network for strong move selection.
 import numpy as np
 import os, time, curses
 
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 import tensorflow as tf
 
 tf.get_logger().setLevel("ERROR")
 
 from gomoku import (
-    BOARD_SIZE, EMPTY, PLAYER1, PLAYER2,
+    EMPTY, PLAYER1, PLAYER2,
     GomokuGame,
 )
 from entrypoint_shared import (

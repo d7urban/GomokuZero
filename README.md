@@ -72,13 +72,18 @@ python eval.py --openings 200
 python eval.py --checkpoint weights/gomoku_best.weights.h5 --calibrate-sims --sim-levels 100,400,1600
 
 # Run tournament across all weight files in a folder
-python eval.py --tournament-dir botb-weights
+python eval_tournament.py --tournament-dir botb-weights
+
+# Tournament with practical-tie (shared-gold) settings
+python eval_tournament.py --tournament-dir botb-weights --shared-gold-margin 0.02 --shared-gold-min-games 120
 
 # Run eval without changing persistent ratings
 python eval.py --no-rating-update
 ```
 
 Standard eval runs update persistent Glicko-2 ratings in `weights/glicko2_ratings.pkl`.
+Tournament mode uses transient in-memory ratings and does not write that file.
+`eval.py --tournament-dir ...` is still supported as a compatibility wrapper.
 
 ### Playing
 
@@ -150,7 +155,8 @@ python play_qt.py
 
 - `gomoku.py` - Core game logic, neural network, and MCTS implementation
 - `train.py` - Self-play training loop with inline evaluation
-- `eval.py` - Checkpoint evaluation and ELO calculation
+- `eval.py` - Checkpoint evaluation, calibration, and persistent Glicko-2 updates
+- `eval_tournament.py` - Tournament runner (round-robin + heads-up final with shared-gold tie handling)
 - `play.py` - Interactive terminal UI for human vs AI
 - `play_qt.py` - PyQt6 graphical UI (human vs AI / human vs human, analysis heatmap)
 - `book_openings.py` - Opening book for evaluation consistency

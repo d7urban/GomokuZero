@@ -63,10 +63,10 @@ def resolve_difficulty(value):
         return key, DIFFICULTY_SIMS[key]
     try:
         sims = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as err:
         raise ValueError(
             "Invalid --difficulty. Use easy|medium|hard or a positive integer sims count."
-        )
+        ) from err
     if sims <= 0:
         raise ValueError("Custom --difficulty sims must be a positive integer.")
     return "Custom", sims

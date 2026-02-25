@@ -10,7 +10,6 @@ initialises the GPU.  All other code in this module uses only NumPy.
 """
 
 import numpy as np
-import os
 import warnings
 from math import sqrt as _sqrt
 
@@ -34,6 +33,7 @@ if _USE_ACCEL and not _USE_ACCEL_SELECT:
         "mcts_accel missing SELECT_CHILD_PARENT_VIEW; "
         "using Python select_child. Rebuild with setup_accel.py.",
         RuntimeWarning,
+        stacklevel=2,
     )
 
 # ── Optional Numba acceleration for threat planes ─────────────────────────
@@ -104,7 +104,7 @@ class GomokuGame:
         return self.board * self.current_player
 
     def get_valid_moves(self):
-        return list(zip(*np.where(self.board == EMPTY)))
+        return list(zip(*np.where(self.board == EMPTY), strict=False))
 
     def make_move(self, row, col):
         """Returns (reward, done). reward=1 means current player wins."""
@@ -190,7 +190,7 @@ def _compute_threat_planes(my, opp, out, size):
         """Count stones in all windows, mark matching cells."""
         my_c = np.zeros_like(my_slices[0], dtype=np.int8)
         op_c = np.zeros_like(my_slices[0], dtype=np.int8)
-        for ms, os_ in zip(my_slices, opp_slices):
+        for ms, os_ in zip(my_slices, opp_slices, strict=False):
             my_c += ms
             op_c += os_
 
@@ -313,7 +313,6 @@ def create_model(board_size=BOARD_SIZE, num_res_blocks=6, num_filters=128,
     TF/Keras are imported here (lazily) so that worker processes can
     configure GPU visibility before the first import.
     """
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
     import tensorflow as tf
     from tensorflow import keras
     from tensorflow.keras import layers
@@ -407,11 +406,11 @@ def get_candidate_moves(board, distance=1, density_threshold=2, frontier=None):
     n_occupied = int(np.count_nonzero(board))
 
     if n_occupied < density_threshold:
-        return list(zip(*np.where(board == EMPTY)))
+        return list(zip(*np.where(board == EMPTY), strict=False))
 
     # Fast path: use pre-computed frontier from GomokuGame
     if frontier is not None:
-        return list(zip(*np.where((board == EMPTY) & (frontier > 0))))
+        return list(zip(*np.where((board == EMPTY) & (frontier > 0)), strict=False))
 
     # Fallback: dilation (used when frontier not available)
     if _USE_ACCEL:
@@ -428,7 +427,7 @@ def get_candidate_moves(board, distance=1, density_threshold=2, frontier=None):
             nearby[dst_r0:dst_r1, dst_c0:dst_c1] |= (board[src_r0:src_r1, src_c0:src_c1] != EMPTY)
 
     nearby &= (board == EMPTY)
-    return list(zip(*np.where(nearby)))
+    return list(zip(*np.where(nearby), strict=False))
 
 
 # ── Shared helpers ──────────────────────────────────────────────────────────

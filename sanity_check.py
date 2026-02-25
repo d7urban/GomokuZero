@@ -376,7 +376,7 @@ def train_micro(s, p, v):
         vloss = tf.reduce_mean(tf.square(v - val))
         loss = ploss + vloss
     grads = tape.gradient(loss, micro_model.trainable_variables)
-    optimizer.apply_gradients(zip(grads, micro_model.trainable_variables))
+    optimizer.apply_gradients(zip(grads, micro_model.trainable_variables, strict=False))
     return ploss, vloss, loss
 
 initial_loss = None
@@ -544,12 +544,12 @@ try:
             loss = ploss + vloss
         grads = tape.gradient(loss, mdl.trainable_variables)
         grads, _ = tf.clip_by_global_norm(grads, 5.0)
-        opt.apply_gradients(zip(grads, mdl.trainable_variables))
+        opt.apply_gradients(zip(grads, mdl.trainable_variables, strict=False))
         return ploss, vloss, loss
 
     actual_batch = min(SMOKE_BATCH, len(replay))
     losses = []
-    for step in range(SMOKE_TRAIN_STEPS):
+    for _step in range(SMOKE_TRAIN_STEPS):
         idxs = np.random.choice(len(replay), actual_batch, replace=len(replay) < actual_batch)
         batch = [replay[i] for i in idxs]
         s = np.array([b[0] for b in batch])

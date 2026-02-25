@@ -1,0 +1,3 @@
+[lint]
+# Keep Ruff focused on correctness/runtime issues by default.
+select = ["F", "E9"]
