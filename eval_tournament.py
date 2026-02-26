@@ -52,6 +52,12 @@ TOURNEY_MCM_MAX_PLAYERS = 24
 TOURNEY_SHARED_GOLD_MARGIN = 0.02
 TOURNEY_SHARED_GOLD_MIN_GAMES = 120
 
+# Keep canonical live pointers out of tournament pools.
+TOURNEY_EXCLUDED_BASENAMES = {
+    "gomoku_best.weights.h5",
+    "gomoku_weights.weights.h5",
+}
+
 
 def find_weight_files(weights_dir):
     """Find model weight files in a directory for tournament mode."""
@@ -63,6 +69,8 @@ def find_weight_files(weights_dir):
             if not os.path.isfile(fp):
                 continue
             key = os.path.normpath(fp)
+            if os.path.basename(key).lower() in TOURNEY_EXCLUDED_BASENAMES:
+                continue
             if key in seen:
                 continue
             seen.add(key)

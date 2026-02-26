@@ -21,6 +21,14 @@ GLICKO2_TAU = 0.5
 GLICKO2_EPSILON = 1e-6
 GLICKO2_SCALE = 173.7178
 
+# Defensive sanity bounds. Values outside these ranges are treated as
+# corrupted persistence artifacts and reset to defaults.
+GLICKO2_SANITY_RATING_ABS_MAX = 5000.0
+GLICKO2_SANITY_RD_MIN = 1.0
+GLICKO2_SANITY_RD_MAX = 1000.0
+GLICKO2_SANITY_VOL_MIN = 1e-6
+GLICKO2_SANITY_VOL_MAX = 1.0
+
 
 def _normalize_rating_key(checkpoint_path):
     if not checkpoint_path:
@@ -50,6 +58,67 @@ def _new_glicko2_entry(checkpoint_path, rating_key):
         "periods": 0,
         "updated_unix": int(time.time()),
     }
+
+
+def _sanitize_rating_rd(rating, rd):
+    changed = False
+    try:
+        rating = float(rating)
+    except Exception:
+        rating = float(GLICKO2_RATING0)
+        changed = True
+    try:
+        rd = float(rd)
+    except Exception:
+        rd = float(GLICKO2_RD0)
+        changed = True
+
+    if (not math.isfinite(rating)
+            or abs(rating) > GLICKO2_SANITY_RATING_ABS_MAX):
+        rating = float(GLICKO2_RATING0)
+        changed = True
+    if (not math.isfinite(rd)
+            or rd < GLICKO2_SANITY_RD_MIN
+            or rd > GLICKO2_SANITY_RD_MAX):
+        rd = float(GLICKO2_RD0)
+        changed = True
+    return rating, rd, changed
+
+
+def _sanitize_vol(vol):
+    changed = False
+    try:
+        vol = float(vol)
+    except Exception:
+        vol = float(GLICKO2_VOL0)
+        changed = True
+    if (not math.isfinite(vol)
+            or vol < GLICKO2_SANITY_VOL_MIN
+            or vol > GLICKO2_SANITY_VOL_MAX):
+        vol = float(GLICKO2_VOL0)
+        changed = True
+    return vol, changed
+
+
+def _sanitize_glicko2_triplet(rating, rd, vol):
+    rating, rd, changed_a = _sanitize_rating_rd(rating, rd)
+    vol, changed_b = _sanitize_vol(vol)
+    return rating, rd, vol, (changed_a or changed_b)
+
+
+def _sanitize_glicko2_entry(entry):
+    if not isinstance(entry, dict):
+        return False
+    rating, rd, vol, changed = _sanitize_glicko2_triplet(
+        entry.get("rating", GLICKO2_RATING0),
+        entry.get("rd", GLICKO2_RD0),
+        entry.get("vol", GLICKO2_VOL0),
+    )
+    if changed:
+        entry["rating"] = rating
+        entry["rd"] = rd
+        entry["vol"] = vol
+    return changed
 
 
 def _merge_glicko2_entries(left, right):
@@ -104,6 +173,8 @@ def _migrate_rating_table_keys(table):
         if checkpoint_path:
             row["checkpoint_path"] = checkpoint_path
         row["rating_key"] = new_key
+        if _sanitize_glicko2_entry(row):
+            changed = True
 
         if new_key in migrated:
             migrated[new_key] = _merge_glicko2_entries(migrated[new_key], row)
@@ -189,6 +260,8 @@ def get_glicko2_entry(table, checkpoint_path, create=True):
         entry["checkpoint_path"] = os.path.normpath(str(checkpoint_path))
     if entry is not None and key is not None:
         entry["rating_key"] = key
+    if entry is not None:
+        _sanitize_glicko2_entry(entry)
     return entry
 
 
@@ -226,15 +299,25 @@ def _glicko2_expectation(mu, mu_j, phi_j):
 
 
 def _glicko2_f(x, delta, phi, v, a, tau):
-    ex = math.exp(x)
-    num = ex * (delta * delta - phi * phi - v - ex)
-    den = 2.0 * (phi * phi + v + ex) ** 2
-    return (num / den) - ((x - a) / (tau * tau))
+    # Numerically stable evaluation for extreme x:
+    # as x -> +inf, ex dominates and the fraction term -> -0.5.
+    # as x -> -inf, ex -> 0 and the fraction term -> 0.
+    if x > 50.0:
+        frac = -0.5
+    elif x < -50.0:
+        frac = 0.0
+    else:
+        ex = math.exp(x)
+        phi2 = phi * phi
+        base = phi2 + v + ex
+        frac = (ex * (delta * delta - phi2 - v - ex)) / (2.0 * base * base)
+    return frac - ((x - a) / (tau * tau))
 
 
 def glicko2_update_player(rating, rd, vol, matches,
                           tau=GLICKO2_TAU, epsilon=GLICKO2_EPSILON):
     """Update one player from a list of (opp_rating, opp_rd, score)."""
+    rating, rd, vol, _ = _sanitize_glicko2_triplet(rating, rd, vol)
     if not matches:
         return float(rating), float(rd), float(vol)
 
@@ -244,6 +327,7 @@ def glicko2_update_player(rating, rd, vol, matches,
     v_inv = 0.0
     delta_sum = 0.0
     for opp_rating, opp_rd, score in matches:
+        opp_rating, opp_rd, _ = _sanitize_rating_rd(opp_rating, opp_rd)
         mu_j, phi_j = _glicko2_to_internal(opp_rating, opp_rd)
         g_phi_j = _glicko2_g(phi_j)
         expected = _glicko2_expectation(mu, mu_j, phi_j)
@@ -335,6 +419,8 @@ def apply_match_glicko2_update(table, candidate_path, opponent_path,
     opp = get_glicko2_entry(table, opponent_path, create=True)
     if cand is None or opp is None:
         return None
+    _sanitize_glicko2_entry(cand)
+    _sanitize_glicko2_entry(opp)
     cand_key = cand.get("rating_key") or _normalize_rating_key(candidate_path)
     opp_key = opp.get("rating_key") or _normalize_rating_key(opponent_path)
     if not cand_key:

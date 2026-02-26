@@ -26,6 +26,7 @@ mcts_accel.cpython-*.so
 weights/
 weights-run-1/
 weights-run-2/
+weights-run-3/
 botb-weights/
 Mixed-competitor-weights/
 *.h5
