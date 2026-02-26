@@ -94,24 +94,35 @@ if [[ ! -f "eval_tournament.py" ]]; then
 fi
 
 read_game_count() {
-  if [[ ! -f "weights/train_state.pkl" ]]; then
-    echo "0"
-    return 0
-  fi
-
   "$python_bin" - <<'PY'
 import pickle
+import os
 
-state_path = "weights/train_state.pkl"
-game_count = 0
-try:
-    with open(state_path, "rb") as f:
-        state = pickle.load(f)
-    if isinstance(state, dict):
-        game_count = int(state.get("game_count", 0))
-except Exception:
-    game_count = 0
-print(game_count)
+paths = ("weights/train_state.pkl", "weights/model_config.pkl")
+for path in paths:
+    if not os.path.exists(path):
+        continue
+    try:
+        with open(path, "rb") as f:
+            state = pickle.load(f)
+    except Exception:
+        continue
+    if not isinstance(state, dict):
+        continue
+
+    # train.py persists total_games (current schema). Keep legacy fallback.
+    for key in ("total_games", "game_count"):
+        val = state.get(key)
+        if val is None:
+            continue
+        try:
+            games = int(val)
+        except Exception:
+            continue
+        print(max(0, games))
+        raise SystemExit(0)
+
+print(0)
 PY
 }
 
