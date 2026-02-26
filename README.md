@@ -48,12 +48,32 @@ Train the network via self-play:
 python train.py
 ```
 
+`train.py` resumes automatically if `weights/gomoku_weights.weights.h5` exists.
+To start fresh, delete `weights/` manually before running.
+
 Training parameters can be adjusted in `train.py`. The script will:
 - Generate self-play games using batched MCTS
 - Train the network on policy and value targets
 - Save checkpoints to `weights/`
 - Keep plateau/autotune safeguards in-loop (inline eval/promotion disabled by default)
 - Hand off checkpoint ranking/promotion to manual tournament runs
+
+Run the training+tournament cycle until a total game goal:
+
+```bash
+./train_tournament_loop.sh --games-goal 50000
+
+# Optional tournament folder and extra tournament args after --
+./train_tournament_loop.sh --games-goal 120000 --tournament-dir botb-weights -- --mcmahon-rounds 6
+```
+
+`train_tournament_loop.sh` runs `train.py` (10,000 games/chunk from `NUM_GAMES`),
+then `eval_tournament.py`, and repeats until `weights/train_state.pkl` reaches
+`--games-goal`. Both module calls in the loop run with `2>/dev/null`.
+It auto-selects Swiss rounds per cycle by tournament player count:
+`<=70 -> 6`, `71-140 -> 7`, `>140 -> 8`.
+To override this, pass `--swiss-rounds` after `--`, e.g.
+`./train_tournament_loop.sh --games-goal 120000 -- --swiss-rounds 7`.
 
 ### Evaluation
 
@@ -100,6 +120,8 @@ bar, and writes outputs inside the tournament folder by default:
 `<tournament-dir>/glicko2_ratings.pkl`,
 `<tournament-dir>/gomoku_best.weights.h5`,
 `<tournament-dir>/best_checkpoint.pkl`.
+Tournament discovery automatically excludes
+`gomoku_best.weights.h5` and `gomoku_weights.weights.h5`.
 Use `--no-persist-ratings --no-promote-winner` for dry-run/transient behavior.
 `eval.py --tournament-dir ...` remains supported as a compatibility wrapper.
 
@@ -175,6 +197,7 @@ python play_qt.py
 - `train.py` - Self-play training loop (inline eval/promotion disabled by default)
 - `eval.py` - Checkpoint evaluation, calibration, and persistent Glicko-2 updates
 - `eval_tournament.py` - Swiss + McMahon tournament runner with persistent ratings and best-checkpoint promotion
+- `train_tournament_loop.sh` - Repeats 10k-game training chunks + tournament until a target total game count
 - `play.py` - Interactive terminal UI for human vs AI
 - `play_qt.py` - PyQt6 graphical UI (human vs AI / human vs human, analysis heatmap)
 - `book_openings.py` - Opening book for evaluation consistency

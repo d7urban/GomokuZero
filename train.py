@@ -1384,22 +1384,12 @@ def _setup_training_run():
     starting_game = 0
     replay = deque(maxlen=REPLAY_SIZE)
 
-    # Resume from checkpoint if available
+    # Resume automatically from checkpoint if available.
     if os.path.exists(weights_file):
-        choice = input(f"\nFound {weights_file} — continue training? "
-                       "(press Enter to continue, 'n' to start fresh): "
-                       ).strip().lower()
-        if choice == "n":
-            shutil.rmtree("weights", ignore_errors=True)
-            os.makedirs("weights", exist_ok=True)
-            lr_state = None
-            eval_state = None
-            print("  Deleted weights/ — starting fresh.\n")
-        else:
-            model.load_weights(weights_file)
-            starting_game, lr_state, eval_state = _load_training_state(
-                model, optimizer, replay)
-            print("  Loaded existing weights.\n")
+        model.load_weights(weights_file)
+        starting_game, lr_state, eval_state = _load_training_state(
+            model, optimizer, replay)
+        print("  Loaded existing weights.\n")
     else:
         lr_state = None
         eval_state = None
