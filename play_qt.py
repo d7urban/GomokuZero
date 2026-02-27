@@ -181,6 +181,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         self.analysis_policy = None
         self.analysis_root_q = None
         self.analysis_sims_done = 0
+        self.ai_turn_request_id = 0
         self.game = GomokuGame()
         self.human_player = PLAYER1
         self.human_turn = True
@@ -442,6 +443,10 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
     def _set_message(self, msg):
         self.message_label.setText(msg)
 
+    def _cancel_pending_ai_turn(self):
+        # Invalidate any queued _run_ai_turn callback created via QTimer.singleShot.
+        self.ai_turn_request_id += 1
+
     def _on_weight_mode_changed(self):
         is_file = self.weight_mode.currentData() == "file"
         self.weight_path.setEnabled(is_file)
@@ -535,6 +540,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
             else:
                 self._set_message("Switched to Human vs AI.")
         else:
+            self._cancel_pending_ai_turn()
             self.human_only_mode = True
             self.human_turn = True
             self._apply_mode_state()
@@ -751,6 +757,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
             self._show_error(f"Failed to load game:\n{e}")
             return
 
+        self._cancel_pending_ai_turn()
         self._stop_analysis(wait=True, clear=True)
 
         blockers = [
@@ -826,6 +833,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         self._set_message(f"Game loaded from {path}")
 
     def new_game(self):
+        self._cancel_pending_ai_turn()
         if self._is_human_only():
             self._stop_analysis(wait=False, clear=True)
             self.game = GomokuGame()
@@ -854,6 +862,10 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
             self._restart_analysis_if_needed()
 
     def undo_last_pair(self):
+        # Undo changes board/player-to-move; reset any stale analysis first.
+        self._cancel_pending_ai_turn()
+        self._stop_analysis(wait=True, clear=True)
+
         if self._is_human_only():
             if self.game.undo_move():
                 self.game_over = False
@@ -864,24 +876,36 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
             else:
                 self._set_message("Nothing to undo.")
                 self._refresh_board()
+                self._restart_analysis_if_needed()
             return
 
         if self.ai is None:
             self._show_error("Load a model first.")
             return
 
-        if self.game.undo_move() and self.game.undo_move():
-            self.game_over = False
-            self.human_turn = (self.game.current_player == self.human_player)
-            self._set_message("Undone.")
-            self._refresh_board()
-            if not self.human_turn:
-                self._begin_ai_turn()
-            else:
-                self._restart_analysis_if_needed()
-        else:
+        # H-vs-A undo semantics:
+        # - If AI is currently thinking (human_turn=False), undo one pending human move.
+        # - Otherwise (human_turn=True), undo a full human+AI pair.
+        n_to_undo = 1 if not self.human_turn else 2
+        if len(self.game.move_history) < n_to_undo:
             self._set_message("Nothing to undo.")
             self._refresh_board()
+            self._restart_analysis_if_needed()
+            return
+
+        for _ in range(n_to_undo):
+            self.game.undo_move()
+        self.game_over = False
+        self.human_turn = (self.game.current_player == self.human_player)
+        if n_to_undo == 1:
+            self._set_message("Undid last move (canceled AI turn).")
+        else:
+            self._set_message("Undone.")
+        self._refresh_board()
+        if not self.human_turn:
+            self._begin_ai_turn()
+        else:
+            self._restart_analysis_if_needed()
 
     def on_cell_clicked(self, row, col):
         if (not self._is_human_only()) and self.ai is None:
@@ -923,6 +947,8 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         self._begin_ai_turn()
 
     def _begin_ai_turn(self):
+        self._cancel_pending_ai_turn()
+        request_id = self.ai_turn_request_id
         self._stop_analysis(wait=True, clear=True)
         if self._is_human_only():
             return
@@ -935,12 +961,14 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.processEvents(
             QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
         )
-        QtCore.QTimer.singleShot(0, self._run_ai_turn)
+        QtCore.QTimer.singleShot(0, lambda rid=request_id: self._run_ai_turn(rid))
 
-    def _run_ai_turn(self):
+    def _run_ai_turn(self, request_id=None):
+        if request_id is not None and int(request_id) != int(self.ai_turn_request_id):
+            return
         if self._is_human_only():
             return
-        if self.ai is None or self.game_over:
+        if self.ai is None or self.game_over or self.human_turn:
             return
         try:
             row, col, val = self.ai.get_move(self.game)
@@ -974,6 +1002,21 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
             and self.human_turn
         )
 
+    def _analysis_worker_matches_position(self):
+        worker = self.analysis_worker
+        if worker is None:
+            return False
+        worker_game = getattr(worker, "game", None)
+        if worker_game is None:
+            return False
+        if getattr(worker, "predict_fn", None) is not self.predict_fn:
+            return False
+        if int(worker_game.current_player) != int(self.game.current_player):
+            return False
+        if len(worker_game.move_history) != len(self.game.move_history):
+            return False
+        return np.array_equal(worker_game.board, self.game.board)
+
     def _start_analysis(self):
         if not self._analysis_should_run():
             return
@@ -1002,6 +1045,11 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
             worker.request_stop()
             if wait:
                 worker.wait()
+                # When waiting synchronously, clear dead worker immediately.
+                # Otherwise _start_analysis() may see a stale non-None handle
+                # before the finished signal callback runs.
+                if self.analysis_worker is worker:
+                    self.analysis_worker = None
         if clear:
             self.analysis_policy = None
             self.analysis_root_q = None
@@ -1012,8 +1060,11 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
     def _restart_analysis_if_needed(self):
         should_run = self._analysis_should_run()
         if should_run:
-            # Restart only if no worker is active.
             if self.analysis_worker is None:
+                self._start_analysis()
+            elif not self._analysis_worker_matches_position():
+                # Board/player/model changed: restart analysis from current position.
+                self._stop_analysis(wait=True, clear=True)
                 self._start_analysis()
         else:
             self._stop_analysis(wait=False, clear=True)
