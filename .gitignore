@@ -27,6 +27,7 @@ weights/
 weights-run-1/
 weights-run-2/
 weights-run-3/
+weights-run-4/
 botb-weights/
 Mixed-competitor-weights/
 *.h5

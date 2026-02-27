@@ -9,6 +9,7 @@ widgets instead of curses/CLI prompts.
 import os
 import sys
 import time
+import json
 
 import numpy as np
 
@@ -173,6 +174,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         self.predict_fn = None
         self.ai = None
         self.loaded_model_text = "Not loaded"
+        self.loaded_weight_file = ""
         self.human_only_mode = False
         self.analysis_worker = None
         self.analysis_session_id = 0
@@ -293,6 +295,14 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         self.undo_btn.setEnabled(False)
         btn_row.addWidget(self.undo_btn)
 
+        self.save_game_btn = QtWidgets.QPushButton("Save Game")
+        self.save_game_btn.clicked.connect(self.save_game)
+        btn_row.addWidget(self.save_game_btn)
+
+        self.load_game_btn = QtWidgets.QPushButton("Load Game")
+        self.load_game_btn.clicked.connect(self.load_game)
+        btn_row.addWidget(self.load_game_btn)
+
         quit_btn = QtWidgets.QPushButton("Quit")
         quit_btn.clicked.connect(self.close)
         btn_row.addWidget(quit_btn)
@@ -380,6 +390,14 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
             return resolve_difficulty(str(int(self.custom_sims.value())))
         return resolve_difficulty(mode)
 
+    @staticmethod
+    def _set_combo_data(combo, value):
+        idx = combo.findData(value)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+            return True
+        return False
+
     def _is_human_only(self):
         return self.human_only_mode
 
@@ -408,9 +426,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         self.side_label.setText(self._selected_side_text())
         if not self.analysis_check.isChecked():
             self.analysis_label.setText("Off")
-        elif self._is_human_only():
-            self.analysis_label.setText("Unavailable in Human vs Human")
-        elif self.ai is None:
+        elif self.predict_fn is None:
             self.analysis_label.setText("Waiting for model")
         elif self.game_over:
             self.analysis_label.setText("Paused (game over)")
@@ -427,7 +443,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         self.message_label.setText(msg)
 
     def _on_weight_mode_changed(self):
-        is_file = (not self._is_human_only()) and self.weight_mode.currentData() == "file"
+        is_file = self.weight_mode.currentData() == "file"
         self.weight_path.setEnabled(is_file)
         self.browse_btn.setEnabled(is_file)
 
@@ -469,21 +485,25 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
     def _apply_mode_state(self):
         human_only = self._is_human_only()
 
-        self.weight_mode.setEnabled(not human_only)
+        self.weight_mode.setEnabled(True)
         self.diff_combo.setEnabled(not human_only)
         self.side_combo.setEnabled(not human_only)
-        self.load_btn.setEnabled(not human_only)
-        self.analysis_check.setEnabled(not human_only)
+        self.load_btn.setEnabled(True)
+        self.analysis_check.setEnabled(True)
 
         if human_only:
-            self._stop_analysis(wait=False, clear=True)
-            self.weight_path.setEnabled(False)
-            self.browse_btn.setEnabled(False)
+            self._on_weight_mode_changed()
             self.custom_sims.setEnabled(False)
             self.new_game_btn.setEnabled(True)
             self.undo_btn.setEnabled(True)
-            self.model_label.setText("Not used (Human vs Human mode)")
-            self._set_message("Human vs Human mode selected. Click New Game.")
+            if self.predict_fn is None:
+                self.model_label.setText("Not loaded")
+                self._set_message(
+                    "Human vs Human mode selected. Load model for analysis or click New Game."
+                )
+            else:
+                self.model_label.setText(self.loaded_model_text)
+                self._set_message("Human vs Human mode selected. Analysis available.")
         else:
             self._on_weight_mode_changed()
             self._on_difficulty_changed()
@@ -572,6 +592,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         )
 
         self.loaded_model_text = f"{weight_file} ({label})"
+        self.loaded_weight_file = weight_file
         self.model_label.setText(self.loaded_model_text)
         self.new_game_btn.setEnabled(True)
         self.undo_btn.setEnabled(True)
@@ -599,15 +620,210 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         )
 
     def load_model(self):
-        if self._is_human_only():
-            self._show_error("Model loading is disabled in Human vs Human mode.")
-            return
         self._load_model_from_selection(
             mode=self.weight_mode.currentData(),
             explicit_path=self.weight_path.text(),
             show_errors=True,
             startup=False,
         )
+
+    def _snapshot_dict(self):
+        return {
+            "format": "gomokuzero-qt-save",
+            "version": 1,
+            "board_size": int(BOARD_SIZE),
+            "saved_at": float(time.time()),
+            "human_only_mode": bool(self.human_only_mode),
+            "human_player": int(self.human_player),
+            "game_over": bool(self.game_over),
+            "move_history": [
+                [int(r), int(c), int(p)] for r, c, p in self.game.move_history
+            ],
+            "weight_mode": str(self.weight_mode.currentData()),
+            "weight_path": str(self.weight_path.text()).strip(),
+            "loaded_weight_file": str(self.loaded_weight_file).strip(),
+            "difficulty_mode": str(self.diff_combo.currentData()),
+            "custom_sims": int(self.custom_sims.value()),
+            "side_combo_player": int(self.side_combo.currentData()),
+            "analysis_enabled": bool(self.analysis_check.isChecked()),
+        }
+
+    @staticmethod
+    def _normalize_save_path(path):
+        low = path.lower()
+        if low.endswith(".json"):
+            return path
+        return f"{path}.json"
+
+    @staticmethod
+    def _restore_game_from_history(raw_history):
+        if not isinstance(raw_history, list):
+            raise ValueError("Invalid save: move_history must be a list.")
+        game = GomokuGame()
+        game_over = False
+        for i, move in enumerate(raw_history):
+            if not (isinstance(move, (list, tuple)) and len(move) == 3):
+                raise ValueError("Invalid save: bad move_history entry.")
+            try:
+                row = int(move[0])
+                col = int(move[1])
+                player = int(move[2])
+            except Exception as e:
+                raise ValueError("Invalid save: non-integer move entry.") from e
+            if player not in (PLAYER1, PLAYER2):
+                raise ValueError("Invalid save: move player must be X/O.")
+            if not (0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE):
+                raise ValueError("Invalid save: move out of board bounds.")
+            if int(game.current_player) != player:
+                raise ValueError("Invalid save: move order is inconsistent.")
+            reward, done = game.make_move(row, col)
+            if reward == -1:
+                raise ValueError("Invalid save: illegal move in move history.")
+            if done and i != len(raw_history) - 1:
+                raise ValueError("Invalid save: extra moves after game over.")
+            if done:
+                game_over = True
+        return game, game_over
+
+    def save_game(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save game",
+            "",
+            "Gomoku save (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        path = self._normalize_save_path(path)
+        try:
+            payload = self._snapshot_dict()
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+        except Exception as e:
+            self._show_error(f"Failed to save game:\n{e}")
+            return
+        self._set_message(f"Game saved to {path}")
+
+    def load_game(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load game",
+            "",
+            "Gomoku save (*.json);;All files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                raise ValueError("Invalid save: expected a JSON object.")
+            if payload.get("format") != "gomokuzero-qt-save":
+                raise ValueError("Invalid save: unsupported file format.")
+            version = int(payload.get("version", 0))
+            if version != 1:
+                raise ValueError(f"Invalid save: unsupported version {version}.")
+            save_board_size = int(payload.get("board_size", 0))
+            if save_board_size != BOARD_SIZE:
+                raise ValueError(
+                    f"Invalid save: board size {save_board_size} != {BOARD_SIZE}."
+                )
+
+            restored_game, game_over = self._restore_game_from_history(
+                payload.get("move_history", [])
+            )
+            requested_mode = bool(payload.get("human_only_mode", False))
+            requested_player = int(payload.get("human_player", PLAYER1))
+            if requested_player not in (PLAYER1, PLAYER2):
+                raise ValueError("Invalid save: human_player must be X or O.")
+
+            requested_weight_mode = str(payload.get("weight_mode", "best"))
+            requested_weight_path = str(payload.get("weight_path", ""))
+            requested_weight_file = str(payload.get("loaded_weight_file", "")).strip()
+            requested_diff_mode = str(payload.get("difficulty_mode", "medium"))
+            requested_custom_sims = int(payload.get("custom_sims", AI_SIMULATIONS))
+            requested_side_player = int(
+                payload.get("side_combo_player", requested_player)
+            )
+            requested_analysis = bool(payload.get("analysis_enabled", False))
+        except Exception as e:
+            self._show_error(f"Failed to load game:\n{e}")
+            return
+
+        self._stop_analysis(wait=True, clear=True)
+
+        blockers = [
+            QtCore.QSignalBlocker(self.weight_mode),
+            QtCore.QSignalBlocker(self.weight_path),
+            QtCore.QSignalBlocker(self.diff_combo),
+            QtCore.QSignalBlocker(self.custom_sims),
+            QtCore.QSignalBlocker(self.side_combo),
+            QtCore.QSignalBlocker(self.analysis_check),
+        ]
+        _ = blockers
+        self._set_combo_data(self.weight_mode, requested_weight_mode)
+        self.weight_path.setText(requested_weight_path)
+        self._set_combo_data(self.diff_combo, requested_diff_mode)
+        self.custom_sims.setValue(max(1, min(20000, requested_custom_sims)))
+        if requested_side_player not in (PLAYER1, PLAYER2):
+            requested_side_player = requested_player
+        self._set_combo_data(self.side_combo, requested_side_player)
+        self.analysis_check.setChecked(requested_analysis)
+
+        if not requested_mode:
+            if (
+                requested_weight_file
+                and (self.ai is None or self.loaded_weight_file != requested_weight_file)
+            ):
+                if not os.path.isfile(requested_weight_file):
+                    self._show_error(
+                        "Saved game references a missing weights file:\n"
+                        f"{requested_weight_file}\n\n"
+                        "Load a model manually, then load the save again."
+                    )
+                    return
+                ok = self._load_model_from_selection(
+                    mode="file",
+                    explicit_path=requested_weight_file,
+                    show_errors=True,
+                    startup=False,
+                )
+                if not ok:
+                    return
+            if self.ai is None:
+                self._show_error(
+                    "This save is Human vs AI but no model is loaded.\n"
+                    "Load a model first, then load the save again."
+                )
+                return
+            difficulty_label, sims = self._selected_difficulty()
+            self.ai.difficulty = difficulty_label
+            self.ai.sims = sims
+
+        # _load_model_from_selection can restart analysis; stop it before swapping game.
+        self._stop_analysis(wait=True, clear=True)
+        self.human_only_mode = requested_mode
+        self.game = restored_game
+        self.game_over = game_over
+        if self.human_only_mode:
+            self.human_player = PLAYER1
+            self.human_turn = True
+        else:
+            self.human_player = requested_player
+            self.human_turn = (
+                (not self.game_over) and (self.game.current_player == self.human_player)
+            )
+
+        self._apply_mode_state()
+        self._refresh_board()
+
+        if (not self.human_only_mode) and (not self.game_over) and (not self.human_turn):
+            self._begin_ai_turn()
+        else:
+            self._restart_analysis_if_needed()
+
+        self._set_message(f"Game loaded from {path}")
 
     def new_game(self):
         if self._is_human_only():
@@ -753,8 +969,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
     def _analysis_should_run(self):
         return (
             self.analysis_check.isChecked()
-            and (not self._is_human_only())
-            and (self.ai is not None)
+            and (self.predict_fn is not None)
             and (not self.game_over)
             and self.human_turn
         )

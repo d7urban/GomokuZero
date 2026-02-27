@@ -50,7 +50,7 @@ from ratings_glicko2 import (
 
 # ── Tunables ────────────────────────────────────────────────────────────────
 CONCURRENT_GAMES  = 20           # games interleaved on GPU simultaneously
-NUM_GAMES         = 10000         # total self-play games
+NUM_GAMES         = 5000         # total self-play games
 C_PUCT            = 1.5
 DIRICHLET_ALPHA   = 0.15
 NOISE_FRAC_START  = 0.35         # Dirichlet noise fraction (anneals down)
@@ -65,7 +65,7 @@ TRAIN_STEPS_RATIO = 4.0          # gradient steps = new_positions * ratio / BATC
 LR                = 1e-3
 WEIGHT_DECAY      = 1e-4
 VALUE_LOSS_COEFF  = 1.0          # weight on value loss (tune if v-loss dominates)
-SAVE_INTERVAL     = 500          # games between checkpoint saves
+SAVE_INTERVAL     = 1000         # games between checkpoint saves
 EVAL_INTERVAL     = 200          # games between diagnostic/promotion checks
 
 # Batched MCTS — leaves evaluated per forward pass.

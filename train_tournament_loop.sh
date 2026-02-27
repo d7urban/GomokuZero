@@ -8,7 +8,7 @@ Usage:
 
 Description:
   Repeats this cycle until train_state game_count reaches --games-goal:
-    1) run train.py (expects 10,000 games per run from train.py NUM_GAMES)
+    1) run train.py (uses train.py NUM_GAMES per run)
     2) run eval_tournament.py --tournament-dir <dir>
   Auto-sets Swiss rounds each cycle from player count in tournament dir:
     <=70 players -> 6 rounds, 71-140 -> 7 rounds, >140 -> 8 rounds
@@ -147,7 +147,7 @@ count_tournament_players() {
   find "$dir" -maxdepth 1 -type f \
     \( -name "*.weights.h5" -o -name "*.h5" -o -name "*.keras" \) \
     -printf '%f\n' \
-    | awk 'tolower($0)!="gomoku_best.weights.h5" && tolower($0)!="gomoku_weights.weights.h5" {c++} END {print c+0}'
+    | awk 'tolower($0)!="gomoku_best.weights.h5" && tolower($0)!="gomoku_weights.weights.h5" && tolower($0)!~/^gomoku_.*_final\.weights\.h5$/ {c++} END {print c+0}'
 }
 
 auto_swiss_rounds_for_players() {
@@ -165,9 +165,6 @@ train_chunk_games="$(sed -nE 's/^[[:space:]]*NUM_GAMES[[:space:]]*=[[:space:]]*(
 if [[ -z "$train_chunk_games" ]]; then
   echo "Could not parse NUM_GAMES from train.py" >&2
   exit 1
-fi
-if [[ "$train_chunk_games" != "10000" ]]; then
-  echo "Warning: train.py NUM_GAMES is $train_chunk_games (expected 10000)." >&2
 fi
 
 current_games="$(read_game_count)"

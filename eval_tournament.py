@@ -57,6 +57,16 @@ TOURNEY_EXCLUDED_BASENAMES = {
     "gomoku_best.weights.h5",
     "gomoku_weights.weights.h5",
 }
+TOURNEY_EXCLUDED_BASENAME_PATTERNS = (
+    re.compile(r"^gomoku_.*_final\.weights\.h5$"),
+)
+
+
+def _is_excluded_tourney_file(path_or_name):
+    base = os.path.basename(str(path_or_name)).lower()
+    if base in TOURNEY_EXCLUDED_BASENAMES:
+        return True
+    return any(pat.fullmatch(base) for pat in TOURNEY_EXCLUDED_BASENAME_PATTERNS)
 
 
 def find_weight_files(weights_dir):
@@ -69,7 +79,7 @@ def find_weight_files(weights_dir):
             if not os.path.isfile(fp):
                 continue
             key = os.path.normpath(fp)
-            if os.path.basename(key).lower() in TOURNEY_EXCLUDED_BASENAMES:
+            if _is_excluded_tourney_file(key):
                 continue
             if key in seen:
                 continue
