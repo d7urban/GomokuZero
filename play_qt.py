@@ -81,7 +81,9 @@ class SquareCellButton(QtWidgets.QPushButton):
 class AnalysisWorker(QtCore.QThread):
     """Background pondering worker that continuously expands one MCTS root."""
 
-    analysis_update = QtCore.pyqtSignal(int, object, float, int)
+    # Use a single Python-object payload to avoid brittle C++ signature
+    # resolution across PyQt/SIP versions when emitting from worker threads.
+    analysis_update = QtCore.pyqtSignal(object)
     analysis_error = QtCore.pyqtSignal(int, str)
 
     def __init__(
@@ -137,10 +139,12 @@ class AnalysisWorker(QtCore.QThread):
                     root = ctx["root"]
                     pi = mcts_policy(root, board_size=BOARD_SIZE, temperature=1.0)
                     self.analysis_update.emit(
-                        self.session_id,
-                        pi,
-                        float(root.q_value),
-                        int(ctx["sims_done"]),
+                        (
+                            self.session_id,
+                            pi,
+                            float(root.q_value),
+                            int(ctx["sims_done"]),
+                        )
                     )
                     last_emit = now
 
@@ -148,10 +152,12 @@ class AnalysisWorker(QtCore.QThread):
             root = ctx["root"]
             pi = mcts_policy(root, board_size=BOARD_SIZE, temperature=1.0)
             self.analysis_update.emit(
-                self.session_id,
-                pi,
-                float(root.q_value),
-                int(ctx["sims_done"]),
+                (
+                    self.session_id,
+                    pi,
+                    float(root.q_value),
+                    int(ctx["sims_done"]),
+                )
             )
         except Exception as e:
             self.analysis_error.emit(self.session_id, str(e))
@@ -181,6 +187,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         self.analysis_policy = None
         self.analysis_root_q = None
         self.analysis_sims_done = 0
+        self.analysis_started_at = 0.0
         self.ai_turn_request_id = 0
         self.game = GomokuGame()
         self.human_player = PLAYER1
@@ -325,6 +332,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
             layout, 6, "Message", "Load model to begin.", word_wrap=True
         )
         self.analysis_label = self._add_status_row(layout, 7, "Analysis", "Off")
+        self.analysis_sps_label = self._add_status_row(layout, 8, "Sims/sec", "-")
 
     def _add_status_row(self, layout, row, label, value, word_wrap=False):
         layout.addWidget(QtWidgets.QLabel(label), row, 0)
@@ -427,18 +435,29 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         self.side_label.setText(self._selected_side_text())
         if not self.analysis_check.isChecked():
             self.analysis_label.setText("Off")
+            self.analysis_sps_label.setText("-")
         elif self.predict_fn is None:
             self.analysis_label.setText("Waiting for model")
+            self.analysis_sps_label.setText("-")
         elif self.game_over:
             self.analysis_label.setText("Paused (game over)")
+            self.analysis_sps_label.setText("-")
         elif not self.human_turn:
             self.analysis_label.setText("Paused (AI turn)")
+            self.analysis_sps_label.setText("-")
         elif self.analysis_policy is None:
             self.analysis_label.setText("Starting...")
+            self.analysis_sps_label.setText("-")
         else:
             self.analysis_label.setText(
                 f"Running: {self.analysis_sims_done} sims, root {self.analysis_root_q:+.2f}"
             )
+            elapsed = max(0.0, time.time() - float(self.analysis_started_at))
+            if elapsed > 0.0 and self.analysis_sims_done > 0:
+                sps = float(self.analysis_sims_done) / elapsed
+                self.analysis_sps_label.setText(f"{sps:.1f}")
+            else:
+                self.analysis_sps_label.setText("-")
 
     def _set_message(self, msg):
         self.message_label.setText(msg)
@@ -1026,17 +1045,19 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         self.analysis_policy = None
         self.analysis_root_q = 0.0
         self.analysis_sims_done = 0
-        self.analysis_worker = AnalysisWorker(
+        self.analysis_started_at = time.time()
+        worker = AnalysisWorker(
             session_id=self.analysis_session_id,
             predict_fn=self.predict_fn,
             game=self.game,
             batch_size=AI_MCTS_BATCH,
             c_puct=1.5,
         )
-        self.analysis_worker.analysis_update.connect(self._on_analysis_update)
-        self.analysis_worker.analysis_error.connect(self._on_analysis_error)
-        self.analysis_worker.finished.connect(self._on_analysis_finished)
-        self.analysis_worker.start()
+        self.analysis_worker = worker
+        worker.analysis_update.connect(self._on_analysis_update)
+        worker.analysis_error.connect(self._on_analysis_error)
+        worker.finished.connect(lambda w=worker: self._on_analysis_finished(w))
+        worker.start()
         self._update_status_box()
 
     def _stop_analysis(self, wait=False, clear=False):
@@ -1054,6 +1075,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
             self.analysis_policy = None
             self.analysis_root_q = None
             self.analysis_sims_done = 0
+            self.analysis_started_at = 0.0
             self.analysis_session_id += 1
         self._update_status_box()
 
@@ -1069,12 +1091,15 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         else:
             self._stop_analysis(wait=False, clear=True)
 
-    def _on_analysis_update(self, session_id, policy, root_q, sims_done):
+    def _on_analysis_update(self, payload):
+        session_id, policy, root_q, sims_done = payload
         if int(session_id) != int(self.analysis_session_id):
             return
         self.analysis_policy = np.asarray(policy, dtype=np.float32).ravel()
         self.analysis_root_q = float(root_q)
         self.analysis_sims_done = int(sims_done)
+        if self.analysis_started_at <= 0.0:
+            self.analysis_started_at = time.time()
         self._update_status_box()
         self._refresh_board()
 
@@ -1085,11 +1110,14 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         self.analysis_policy = None
         self.analysis_root_q = None
         self.analysis_sims_done = 0
+        self.analysis_started_at = 0.0
         self._stop_analysis(wait=False, clear=False)
 
-    def _on_analysis_finished(self):
-        # Worker can finish naturally or after stop request.
-        self.analysis_worker = None
+    def _on_analysis_finished(self, worker):
+        # Ignore stale finished callbacks from older workers.
+        if self.analysis_worker is worker:
+            self.analysis_worker = None
+        worker.deleteLater()
         self._update_status_box()
 
     def _refresh_board(self):
