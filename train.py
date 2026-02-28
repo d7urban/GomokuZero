@@ -74,18 +74,22 @@ EVAL_INTERVAL     = 200          # games between diagnostic/promotion checks
 MCTS_BATCH_SIZE   = 10
 
 # Self-play simulation budget
-MCTS_SIMS         = 100          # full-search sims (for policy training)
+MCTS_SIMS         = 160          # full-search sims (for policy training)
+# Fresh-run warmup: start cheaper, then switch to full budget once replay has
+# enough diversity. Set warmup sims >= MCTS_SIMS or replay threshold <= 0 to disable.
+MCTS_SIMS_WARMUP         = 100
+MCTS_SIMS_WARMUP_REPLAY  = 50_000
 
 # Playout cap randomization: most moves get a fast search (value only),
 # some get a full search (policy + value).  This generates more games
 # for the value head while preserving policy quality.
-PCAP_FAST_SIMS    = 20           # sims for fast-search moves
+PCAP_FAST_SIMS    = 32           # sims for fast-search moves
 PCAP_FULL_FRAC    = 0.50         # fraction of moves that get full search
 
 # Asymmetric self-play: in a fraction of games, one side is randomly
 # weakened to produce decisive results and train the value head.
 # The fraction decays linearly so training converges to symmetric play.
-ASYM_WEAK_SIMS    = 40           # sims for the weakened side
+ASYM_WEAK_SIMS    = 64           # sims for the weakened side
 ASYM_FRAC_START   = 0.5          # asymmetric fraction at game 0
 ASYM_FRAC_END     = 0.1          # asymmetric fraction after decay period
 ASYM_DECAY_GAMES  = 3000         # linear decay over this many games
@@ -117,8 +121,8 @@ RESIGN_MIN_MOVES     = 30       # don't check before this many moves
 # 2. Promotion: eval vs current best when diagnostic signal is strong.
 INLINE_EVAL_OPENINGS  = 30       # 30 openings × 2 colors = 60 games (diagnostic)
 PROMOTE_EVAL_OPENINGS = 60       # 60 openings × 2 colors = 120 games (promotion)
-DIAG_EVAL_SIMS        = 100      # lighter than self-play but enough for signal
-PROMOTE_EVAL_SIMS     = 200      # full sims for promotion decisions
+DIAG_EVAL_SIMS        = 160      # lighter than self-play but enough for signal
+PROMOTE_EVAL_SIMS     = 320      # full sims for promotion decisions
 PROMOTE_DIAG_CI_LEVEL = 0.90     # confidence for diagnostic Black CI signal
 PROMOTE_DIAG_BLACK_LOWER = 0.50  # strong diagnostic if Black Wilson lower > this
 PROMOTE_DIAG_WINDOW = 3          # rolling diagnostic history length
@@ -748,7 +752,7 @@ def _load_training_state(model, optimizer, replay):
 # ── Interleaved self-play (multiple games, shared GPU inference) ────────────
 class _InterleavedGame:
     __slots__ = (
-        "game", "sims", "weak_sims", "weak_player",
+        "game", "sims", "fast_sims", "weak_sims", "weak_player",
         "trajectory", "winner", "finished", "move_num",
         "ctx", "root_state", "phase", "move_sims",
         "resign_count", "vs_best", "training_player",
@@ -783,10 +787,11 @@ def _apply_interleaved_opening(game_state, opening):
 
 
 def _init_interleaved_game(cfg, has_best_predict):
-    sims, weak_sims, weak_player, opening, vs_best = cfg
+    sims, fast_sims, weak_sims, weak_player, opening, vs_best = cfg
     game_state = _InterleavedGame()
     game_state.game = GomokuGame()
     game_state.sims = sims
+    game_state.fast_sims = fast_sims
     game_state.weak_sims = weak_sims
     game_state.weak_player = weak_player
     game_state.trajectory = []
@@ -817,7 +822,7 @@ def _set_interleaved_move_budget(game_state, is_best_turn):
         return
 
     if game_state.soft_resigned:
-        game_state.move_sims = PCAP_FAST_SIMS
+        game_state.move_sims = game_state.fast_sims
         game_state.is_full_search = False
         return
 
@@ -828,7 +833,9 @@ def _set_interleaved_move_budget(game_state, is_best_turn):
         return
 
     game_state.is_full_search = np.random.random() < PCAP_FULL_FRAC
-    game_state.move_sims = game_state.sims if game_state.is_full_search else PCAP_FAST_SIMS
+    game_state.move_sims = (
+        game_state.sims if game_state.is_full_search else game_state.fast_sims
+    )
 
 
 def _queue_interleaved_new_move(game_state, bundle, noise_frac, is_best_turn):
@@ -970,6 +977,7 @@ def _advance_interleaved_completed_games(active_games):
             game_state.game.current_player,
             game_state.move_sims,
             game_state.is_full_search,
+            game_state.sims,
         ))
         _update_interleaved_soft_resign(game_state, root, is_best_turn)
         _apply_interleaved_action(game_state, root, pi)
@@ -1404,17 +1412,25 @@ def _setup_training_run():
         optimizer.learning_rate.assign(LR * lr_scheduler.warmup_start_frac)
 
     total = model.count_params()
+    warmup_enabled = (
+        MCTS_SIMS_WARMUP_REPLAY > 0 and MCTS_SIMS_WARMUP > 0 and MCTS_SIMS_WARMUP < MCTS_SIMS
+    )
+    warmup_fast = _scaled_budget_for_sims(MCTS_SIMS_WARMUP, PCAP_FAST_SIMS)
+    warmup_weak = _scaled_budget_for_sims(MCTS_SIMS_WARMUP, ASYM_WEAK_SIMS)
     print(f"Model: {NUM_INPUT_PLANES}ch input, 6 res-blocks × 128 filters + SE, "
           f"{total:,} parameters")
     print(f"MCTS: {MCTS_SIMS} full / {PCAP_FAST_SIMS} fast sims "
           f"({PCAP_FULL_FRAC:.0%} full), batch size {MCTS_BATCH_SIZE} (GPU)")
+    if warmup_enabled:
+        print(f"MCTS warmup: {MCTS_SIMS_WARMUP} full / {warmup_fast} fast / {warmup_weak} weak "
+              f"until replay reaches {MCTS_SIMS_WARMUP_REPLAY:,} positions")
     print(f"Asymmetric play: {ASYM_FRAC_START:.0%}→{ASYM_FRAC_END:.0%} "
           f"over {ASYM_DECAY_GAMES} games, weak side {ASYM_WEAK_SIMS} sims")
     print(f"Openings: {BOOK_OPENING_FRAC:.0%} book, "
           f"{1-BOOK_OPENING_FRAC:.0%} random ({RANDOM_OPENING_PLIES} plies)")
     print(f"Soft resign: threshold {RESIGN_THRESHOLD}, "
           f"{RESIGN_CONSECUTIVE} consecutive, after move {RESIGN_MIN_MOVES} "
-          f"(value-only, {PCAP_FAST_SIMS} sims)")
+          f"(value-only, fast sims from current self-play budget; target {PCAP_FAST_SIMS})")
     from gomoku import _USE_ACCEL, _HAS_NUMBA
     print(f"Cython acceleration: {'enabled' if _USE_ACCEL else 'disabled (run setup_accel.py build_ext --inplace)'}")
     if _USE_ACCEL:
@@ -1439,6 +1455,13 @@ def _setup_training_run():
     print(f"Noise: {NOISE_FRAC_START:.2f}→{NOISE_FRAC_END:.2f} over {NOISE_DECAY_GAMES}g")
     print(f"Replay buffer: {REPLAY_SIZE:,} positions, batch size: {BATCH_SIZE}, "
           f"recent bias: {REPLAY_RECENT_FRAC:.0%} from last {REPLAY_RECENT_SIZE:,}")
+    current_full, current_fast, current_weak = _current_self_play_budgets(len(replay))
+    warmup_active = current_full < MCTS_SIMS
+    if warmup_active:
+        print(f"Self-play sims: warmup active ({current_full}/{current_fast}/{current_weak}) "
+              f"at replay {len(replay):,}/{MCTS_SIMS_WARMUP_REPLAY:,}")
+    else:
+        print(f"Self-play sims: full budget ({current_full}/{current_fast}/{current_weak})")
     print(f"Loss: policy + {VALUE_LOSS_COEFF}×value")
     if lr_scheduler._warmup_done:
         print(f"LR: {lr_scheduler.current_lr:.2e} (tracks P-H gap, "
@@ -1557,7 +1580,33 @@ def _setup_training_run():
         "autotune_noise_boost_until": 0,
         "autotune_asym_boost_value": PLATEAU_AUTOTUNE_STALEMATE_ASYM_BOOST,
         "autotune_noise_boost_value": PLATEAU_AUTOTUNE_STALEMATE_NOISE_BOOST,
+        "sims_warmup_active": warmup_active,
     }
+
+
+def _scaled_budget_for_sims(base_sims, ref_budget):
+    base_sims = max(1, int(base_sims))
+    if MCTS_SIMS <= 0:
+        return max(1, min(base_sims, int(ref_budget)))
+    scaled = int(round(float(ref_budget) * float(base_sims) / float(MCTS_SIMS)))
+    return max(1, min(base_sims, scaled))
+
+
+def _current_self_play_sims(replay_len):
+    warmup_sims = int(MCTS_SIMS_WARMUP)
+    warmup_replay = int(MCTS_SIMS_WARMUP_REPLAY)
+    if warmup_sims <= 0 or warmup_replay <= 0 or warmup_sims >= MCTS_SIMS:
+        return int(MCTS_SIMS)
+    if int(replay_len) < warmup_replay:
+        return warmup_sims
+    return int(MCTS_SIMS)
+
+
+def _current_self_play_budgets(replay_len):
+    full_sims = _current_self_play_sims(replay_len)
+    fast_sims = _scaled_budget_for_sims(full_sims, PCAP_FAST_SIMS)
+    weak_sims = _scaled_budget_for_sims(full_sims, ASYM_WEAK_SIMS)
+    return full_sims, fast_sims, weak_sims
 
 
 def _loop_batch_schedule(game_count, target, loop_state=None):
@@ -1587,21 +1636,29 @@ def _select_self_play_opening(book_openings):
     return RANDOM_OPENING_PLIES
 
 
-def _build_self_play_game_configs(batch_games, book_openings, best_predict_fn, asym_frac):
+def _build_self_play_game_configs(
+    batch_games,
+    book_openings,
+    best_predict_fn,
+    asym_frac,
+    full_sims,
+    fast_sims,
+    weak_sims,
+):
     game_configs = []
     n_asym = 0
     n_vs_best = 0
     for _ in range(batch_games):
         opening = _select_self_play_opening(book_openings)
         if best_predict_fn is not None and np.random.random() < BEST_PLAY_FRAC:
-            game_configs.append((MCTS_SIMS, MCTS_SIMS, None, opening, True))
+            game_configs.append((full_sims, fast_sims, full_sims, None, opening, True))
             n_vs_best += 1
         elif np.random.random() < asym_frac:
             weak = PLAYER1 if np.random.random() < 0.5 else -PLAYER1
-            game_configs.append((MCTS_SIMS, ASYM_WEAK_SIMS, weak, opening, False))
+            game_configs.append((full_sims, fast_sims, weak_sims, weak, opening, False))
             n_asym += 1
         else:
-            game_configs.append((MCTS_SIMS, MCTS_SIMS, None, opening, False))
+            game_configs.append((full_sims, fast_sims, full_sims, None, opening, False))
     return game_configs, n_asym, n_vs_best
 
 
@@ -1621,9 +1678,10 @@ def _trajectory_outcome(winner, player):
     return -1.0
 
 
-def _policy_weight_for_sample(move_sims, is_full):
+def _policy_weight_for_sample(move_sims, is_full, full_sims):
     if is_full:
-        return np.float32(np.sqrt(move_sims / MCTS_SIMS))
+        base = max(1, int(full_sims))
+        return np.float32(np.sqrt(float(move_sims) / float(base)))
     return np.float32(0.0)
 
 
@@ -1638,9 +1696,9 @@ def _ingest_self_play_results(results, replay, game_count, target):
         if resigned:
             n_resigned += 1
         move_counts.append(len(trajectory))
-        for state, pi, player, move_sims, is_full in trajectory:
+        for state, pi, player, move_sims, is_full, full_sims in trajectory:
             outcome = _trajectory_outcome(winner, player)
-            pi_w = _policy_weight_for_sample(move_sims, is_full)
+            pi_w = _policy_weight_for_sample(move_sims, is_full, full_sims)
             replay.append((state, pi, np.float32(outcome), pi_w))
             new_positions += 1
         game_count += 1
@@ -1708,6 +1766,9 @@ def _print_training_batch_status(
     n_asym,
     batch_games,
     asym_frac,
+    full_sims,
+    fast_sims,
+    weak_sims,
     avg_moves,
     n_decisive,
     kept_n,
@@ -1724,6 +1785,7 @@ def _print_training_batch_status(
     print(
         f"Game {game_count:5d}/{target} | "
         f"Asym {n_asym}/{batch_games} ({asym_frac:.0%}) | "
+        f"Sims {full_sims}/{fast_sims}/{weak_sims} | "
         f"Moves {avg_moves:5.1f} | "
         f"Win {n_decisive}/{kept_n}{resign_str}{best_str} | "
         f"P {train_stats['total_ploss']:.4f} V {train_stats['total_vloss']:.4f} "
@@ -1991,8 +2053,30 @@ def _run_iteration_self_play_and_train(loop_ctx, state):
     batch_games, asym_frac, noise_frac = _loop_batch_schedule(
         game_count, target, loop_state=state
     )
+    full_sims, fast_sims, weak_sims = _current_self_play_budgets(len(replay))
+    warmup_active = full_sims < MCTS_SIMS
+    if state.get("sims_warmup_active") is None:
+        state["sims_warmup_active"] = warmup_active
+    elif state["sims_warmup_active"] != warmup_active:
+        if warmup_active:
+            print(f"  Self-play sims warmup active: {full_sims}/{fast_sims}/{weak_sims}",
+                  flush=True)
+        else:
+            print(
+                f"  Self-play sims switched to full budget: "
+                f"{full_sims}/{fast_sims}/{weak_sims} "
+                f"(replay {len(replay):,}/{MCTS_SIMS_WARMUP_REPLAY:,})",
+                flush=True,
+            )
+        state["sims_warmup_active"] = warmup_active
     game_configs, n_asym, n_vs_best = _build_self_play_game_configs(
-        batch_games, book_openings, state["best_predict_fn"], asym_frac
+        batch_games,
+        book_openings,
+        state["best_predict_fn"],
+        asym_frac,
+        full_sims,
+        fast_sims,
+        weak_sims,
     )
     results, sp_time = _run_self_play_batch(
         predict_fn, game_configs, state["best_predict_fn"], noise_frac
@@ -2012,6 +2096,9 @@ def _run_iteration_self_play_and_train(loop_ctx, state):
         n_asym,
         batch_games,
         asym_frac,
+        full_sims,
+        fast_sims,
+        weak_sims,
         avg_moves,
         n_decisive,
         kept_n,
@@ -2099,6 +2186,7 @@ def _run_training_loop(ctx):
         "autotune_noise_boost_value": ctx.get(
             "autotune_noise_boost_value", PLATEAU_AUTOTUNE_STALEMATE_NOISE_BOOST
         ),
+        "sims_warmup_active": ctx.get("sims_warmup_active"),
     }
 
     try:
@@ -2124,6 +2212,7 @@ def _run_training_loop(ctx):
         "autotune_noise_boost_until": state["autotune_noise_boost_until"],
         "autotune_asym_boost_value": state["autotune_asym_boost_value"],
         "autotune_noise_boost_value": state["autotune_noise_boost_value"],
+        "sims_warmup_active": state.get("sims_warmup_active"),
     })
     return interrupted
 

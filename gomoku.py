@@ -65,7 +65,7 @@ PRIOR_UNIFORM_BLEND = 0.05
 class GomokuGame:
     """Five In A Row game logic."""
 
-    _FRONTIER_DIST = 1  # distance-1 neighbours only → ~30-40 candidates
+    _FRONTIER_DIST = 2  # distance-2 neighbours for broader tactical coverage
 
     def __init__(self, size=BOARD_SIZE):
         self.size = size
@@ -77,7 +77,7 @@ class GomokuGame:
         self._frontier = np.zeros((size, size), dtype=np.int16)
 
     def _update_frontier(self, row, col, delta):
-        """Add or remove frontier contribution for one stone. O(25)."""
+        """Add or remove frontier contribution for one stone. O(49)."""
         d = self._FRONTIER_DIST
         s = self.size
         r0 = max(0, row - d); r1 = min(s, row + d + 1)
@@ -392,13 +392,13 @@ def make_predict_fn(model):
 
 
 # ── Nearby-moves optimisation ──────────────────────────────────────────────
-def get_candidate_moves(board, distance=1, density_threshold=2, frontier=None):
+def get_candidate_moves(board, distance=2, density_threshold=2, frontier=None):
     """Return candidate empty squares for MCTS expansion.
 
     When fewer than `density_threshold` stones are on the board, returns ALL
     empty squares.  Once denser, restricts to squares within `distance` of
-    any occupied square.  With distance=1 and typical positions, this gives
-    12-50 candidates — enough for 100 sims to produce meaningful visits.
+    any occupied square. With distance=2 and typical positions, this gives
+    a broader tactical candidate set for MCTS expansion.
 
     If `frontier` is provided (incremental count array from GomokuGame),
     uses a fast np.where instead of dilation.

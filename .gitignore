@@ -30,6 +30,7 @@ weights-run-3/
 weights-run-4/
 botb-weights/
 Mixed-competitor-weights/
+game*.json
 *.h5
 *.pkl
 
