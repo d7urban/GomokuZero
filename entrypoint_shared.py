@@ -31,6 +31,10 @@ DIFFICULTY_SIMS = {
 
 BEST_WEIGHTS = "weights/gomoku_best.weights.h5"
 LATEST_WEIGHTS = "weights/gomoku_weights.weights.h5"
+MODEL_ARCH_CANDIDATES = (
+    (10, 128),
+    (6, 128),
+)
 
 
 class AIPlayer:
@@ -111,9 +115,34 @@ def select_weights(mode="best", explicit_path=""):
 
 
 def load_model_and_predict_fn(weight_file):
-    """Create model, load weights, build predict_fn, and run one warmup call."""
-    model = create_model()
-    model.load_weights(weight_file)
+    """Create model, load weights, build predict_fn, and run one warmup call.
+
+    Supports both legacy 6x128 and newer 10x128 checkpoint architectures.
+    """
+    errors = []
+    model = None
+
+    for num_res_blocks, num_filters in MODEL_ARCH_CANDIDATES:
+        try:
+            candidate = create_model(
+                num_res_blocks=num_res_blocks,
+                num_filters=num_filters,
+            )
+            candidate.load_weights(weight_file)
+            model = candidate
+            break
+        except Exception as e:
+            reason = str(e).splitlines()[0] if str(e) else type(e).__name__
+            errors.append(
+                f"{num_res_blocks}x{num_filters}: {reason}"
+            )
+
+    if model is None:
+        details = "; ".join(errors) if errors else "no loader attempts"
+        raise ValueError(
+            f"Unable to load weights '{weight_file}'. Tried architectures: {details}"
+        )
+
     predict_fn = make_predict_fn(model)
     predict_fn(
         np.zeros(
