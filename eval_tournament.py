@@ -23,6 +23,7 @@ from book_openings import (
     EVAL_OPENING_SEED,
     load_or_create_openings,
 )
+from entrypoint_shared import MODEL_ARCH_CANDIDATES
 from gomoku import create_model
 from ratings_glicko2 import (
     GLICKO2_RATING0,
@@ -89,7 +90,86 @@ def find_weight_files(weights_dir):
     return found
 
 
+def _create_model_for_arch(arch):
+    num_res_blocks, num_filters = arch
+    return create_model(
+        num_res_blocks=num_res_blocks,
+        num_filters=num_filters,
+    )
+
+
+def _format_arch(arch):
+    return f"{arch[0]}x{arch[1]}"
+
+
+def _resolve_weight_architectures(weight_paths):
+    probe_models = {
+        arch: _create_model_for_arch(arch)
+        for arch in MODEL_ARCH_CANDIDATES
+    }
+    resolved = {}
+    skipped = []
+
+    for path in weight_paths:
+        matched = False
+        errors = []
+        for arch in MODEL_ARCH_CANDIDATES:
+            model = probe_models[arch]
+            try:
+                model.load_weights(path)
+                resolved[path] = arch
+                matched = True
+                break
+            except Exception as e:
+                reason = str(e).splitlines()[0] if str(e) else type(e).__name__
+                errors.append(f"{_format_arch(arch)}: {reason}")
+        if matched:
+            continue
+        details = "; ".join(errors) if errors else "no loader attempts"
+        skipped.append((path, details))
+
+    return resolved, skipped
+
+
+def _get_side_model(model_pool, arch):
+    model = model_pool.get(arch)
+    if model is None:
+        model = _create_model_for_arch(arch)
+        model_pool[arch] = model
+    return model
+
+
+def _resolve_compatible_weight_paths(discovered):
+    resolved_arch, skipped = _resolve_weight_architectures(discovered)
+    weight_paths = [path for path in discovered if path in resolved_arch]
+
+    if skipped:
+        print("Skipping incompatible files:")
+        for path, reason in skipped:
+            print(f"  - {os.path.basename(path)}: {reason}")
+        print()
+
+    if len(weight_paths) < 2:
+        print("Need at least two compatible weight files after validation.")
+        return None, None
+
+    if len(weight_paths) != len(discovered):
+        print(f"Using {len(weight_paths)} compatible weight files:")
+        for i, p in enumerate(weight_paths, 1):
+            print(f"  {i:2d}. {os.path.basename(p)}  [{_format_arch(resolved_arch[p])}]")
+        print()
+    else:
+        print("Resolved architectures:")
+        for i, p in enumerate(weight_paths, 1):
+            print(f"  {i:2d}. {os.path.basename(p)}  [{_format_arch(resolved_arch[p])}]")
+        print()
+
+    return weight_paths, resolved_arch
+
+
 def _validate_weight_files_for_model(model, weight_paths):
+    # Backward-compatible shim: retained for external imports/tests.
+    # Tournament execution now resolves per-file architectures.
     valid = []
     skipped = []
     for path in weight_paths:
@@ -437,8 +517,9 @@ def _print_stage_leaderboard(stage_name, stage_paths, stats, ratings_table, limi
 
 
 def _run_stage_pairing(
-    model_a,
-    model_b,
+    model_pool_a,
+    model_pool_b,
+    arch_by_path,
     stage_tag,
     round_idx,
     left_path,
@@ -455,6 +536,10 @@ def _run_stage_pairing(
     right_name = os.path.basename(right_path)
     label = f"{left_name} vs {right_name} [{stage_tag} {round_idx}]"
 
+    left_arch = arch_by_path[left_path]
+    right_arch = arch_by_path[right_path]
+    model_a = _get_side_model(model_pool_a, left_arch)
+    model_b = _get_side_model(model_pool_b, right_arch)
     model_a.load_weights(left_path)
     model_b.load_weights(right_path)
     result = run_match_fn(
@@ -480,8 +565,9 @@ def _run_stage_pairing(
 
 
 def _run_pairing_stage(
-    model_a,
-    model_b,
+    model_pool_a,
+    model_pool_b,
+    arch_by_path,
     stage_name,
     stage_tag,
     stage_paths,
@@ -518,8 +604,9 @@ def _run_pairing_stage(
 
         for left_path, right_path in pairs:
             _run_stage_pairing(
-                model_a=model_a,
-                model_b=model_b,
+                model_pool_a=model_pool_a,
+                model_pool_b=model_pool_b,
+                arch_by_path=arch_by_path,
                 stage_tag=stage_tag,
                 round_idx=round_idx,
                 left_path=left_path,
@@ -622,26 +709,6 @@ def _print_tournament_candidates(tournament_dir, discovered):
     print()
 
 
-def _resolve_compatible_weight_paths(model_probe, discovered):
-    weight_paths, skipped = _validate_weight_files_for_model(model_probe, discovered)
-    if skipped:
-        print("Skipping incompatible files:")
-        for path, reason in skipped:
-            print(f"  - {os.path.basename(path)}: {reason}")
-        print()
-
-    if len(weight_paths) < 2:
-        print("Need at least two compatible weight files after validation.")
-        return None
-
-    if len(weight_paths) != len(discovered):
-        print(f"Using {len(weight_paths)} compatible weight files:")
-        for i, p in enumerate(weight_paths, 1):
-            print(f"  {i:2d}. {os.path.basename(p)}")
-        print()
-    return weight_paths
-
-
 def _load_tournament_openings(args, config):
     needed_openings = max(
         1,
@@ -731,9 +798,8 @@ def run_tournament(args, run_match_fn, eval_batch_size, print_gpu_status_fn=None
         return None
 
     _print_tournament_candidates(args.tournament_dir, discovered)
-    model_probe = create_model()
-    weight_paths = _resolve_compatible_weight_paths(model_probe, discovered)
-    if not weight_paths:
+    weight_paths, arch_by_path = _resolve_compatible_weight_paths(discovered)
+    if not weight_paths or not arch_by_path:
         return None
 
     ratings_table = _load_ratings_table(config)
@@ -747,14 +813,15 @@ def run_tournament(args, run_match_fn, eval_batch_size, print_gpu_status_fn=None
     else:
         print_gpu_status_fn()
 
-    model_a = model_probe
-    model_b = create_model()
+    model_pool_a = {}
+    model_pool_b = {}
     for path in weight_paths:
         get_glicko2_entry(ratings_table, path, create=True)
 
     swiss = _run_pairing_stage(
-        model_a=model_a,
-        model_b=model_b,
+        model_pool_a=model_pool_a,
+        model_pool_b=model_pool_b,
+        arch_by_path=arch_by_path,
         stage_name="Swiss",
         stage_tag="Swiss",
         stage_paths=weight_paths,
@@ -782,8 +849,9 @@ def run_tournament(args, run_match_fn, eval_batch_size, print_gpu_status_fn=None
         if pair[0] in finalist_set and pair[1] in finalist_set
     }
     mcmahon = _run_pairing_stage(
-        model_a=model_a,
-        model_b=model_b,
+        model_pool_a=model_pool_a,
+        model_pool_b=model_pool_b,
+        arch_by_path=arch_by_path,
         stage_name="McMahon",
         stage_tag="McM",
         stage_paths=finalists,

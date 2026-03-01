@@ -299,7 +299,7 @@ if _HAS_NUMBA:
 
 
 # ── Model ───────────────────────────────────────────────────────────────────
-def create_model(board_size=BOARD_SIZE, num_res_blocks=6, num_filters=128,
+def create_model(board_size=BOARD_SIZE, num_res_blocks=10, num_filters=128,
                  se_ratio=4):
     """AlphaZero-style residual CNN with SE global pooling.
 

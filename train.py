@@ -51,6 +51,8 @@ from ratings_glicko2 import (
 # ── Tunables ────────────────────────────────────────────────────────────────
 CONCURRENT_GAMES  = 20           # games interleaved on GPU simultaneously
 NUM_GAMES         = 5000         # total self-play games
+TRAIN_NUM_RES_BLOCKS = 10        # fixed training architecture (10x128)
+TRAIN_NUM_FILTERS = 128
 C_PUCT            = 1.5
 DIRICHLET_ALPHA   = 0.15
 NOISE_FRAC_START  = 0.35         # Dirichlet noise fraction (anneals down)
@@ -62,7 +64,7 @@ REPLAY_SIZE       = 300_000      # positions — larger to reduce forgetting
 REPLAY_RECENT_FRAC = 0.75       # fraction of each batch from recent positions
 REPLAY_RECENT_SIZE = 50_000     # how many most-recent positions count as "recent"
 TRAIN_STEPS_RATIO = 4.0          # gradient steps = new_positions * ratio / BATCH_SIZE
-LR                = 1e-3
+LR                = 7e-4
 WEIGHT_DECAY      = 1e-4
 VALUE_LOSS_COEFF  = 1.0          # weight on value loss (tune if v-loss dominates)
 SAVE_INTERVAL     = 1000         # games between checkpoint saves
@@ -432,7 +434,7 @@ class LRScheduler:
     """
 
     def __init__(self, optimizer, window=200, check_every=50,
-                 patience=5, factor=0.3, min_lr=1e-5, warmup=100,
+                 patience=7, factor=0.5, min_lr=3e-6, warmup=200,
                  rel_threshold=0.005, warmup_start_frac=0.3):
         self.optimizer = optimizer
         self.window = window
@@ -657,6 +659,48 @@ _STATE_PATH  = "weights/train_state.pkl"
 _REPLAY_PATH = "weights/replay_buffer.pkl"
 
 
+def _train_arch_label():
+    return f"{TRAIN_NUM_RES_BLOCKS}x{TRAIN_NUM_FILTERS}"
+
+
+def _create_train_model():
+    return create_model(
+        num_res_blocks=TRAIN_NUM_RES_BLOCKS,
+        num_filters=TRAIN_NUM_FILTERS,
+    )
+
+
+def _weight_error_reason(exc):
+    text = str(exc)
+    return text.splitlines()[0] if text else type(exc).__name__
+
+
+def _load_weights_strict(model, weight_path, role):
+    try:
+        model.load_weights(weight_path)
+    except Exception as e:
+        reason = _weight_error_reason(e)
+        raise ValueError(
+            f"Failed to load {role} weights from '{weight_path}' into "
+            f"{_train_arch_label()} model: {reason}. "
+            f"Training now expects only {_train_arch_label()} checkpoints."
+        ) from e
+
+
+def _load_weights_optional(model, weight_path, role):
+    try:
+        model.load_weights(weight_path)
+        return True
+    except Exception as e:
+        reason = _weight_error_reason(e)
+        print(
+            f"  Skipping {role} '{weight_path}': incompatible with "
+            f"{_train_arch_label()} ({reason})",
+            flush=True,
+        )
+        return False
+
+
 def _get_optimizer_state(optimizer):
     if hasattr(optimizer, "get_weights"):
         return optimizer.get_weights()
@@ -693,7 +737,15 @@ def _save_training_state(game_count, optimizer, replay, lr_scheduler=None,
         pickle.dump(list(replay), f, protocol=pickle.HIGHEST_PROTOCOL)
 
     with open("weights/model_config.pkl", "wb") as f:
-        pickle.dump({"board_size": BOARD_SIZE, "total_games": game_count}, f)
+        pickle.dump(
+            {
+                "board_size": BOARD_SIZE,
+                "total_games": game_count,
+                "num_res_blocks": TRAIN_NUM_RES_BLOCKS,
+                "num_filters": TRAIN_NUM_FILTERS,
+            },
+            f,
+        )
 
 
 def _load_training_state(model, optimizer, replay):
@@ -1125,7 +1177,11 @@ def _run_diagnostic_eval(model, game_count, eval_openings, opp_model):
         label = f"latest cp (g{gc_prev})"
 
     print(f"  ── Diag g{game_count} vs {label} ──", flush=True)
-    opp_model.load_weights(fp_prev)
+    if not _load_weights_optional(
+        opp_model, fp_prev, role="diagnostic opponent checkpoint"
+    ):
+        print("  Diagnostic eval skipped: no compatible opponent checkpoint.", flush=True)
+        return None
     result = run_match_sequential(
         model, opp_model, label,
         openings=eval_openings,
@@ -1167,7 +1223,11 @@ def _run_promotion_match(model, game_count, all_openings, best_gc, opp_model):
     )
     label = f"best (g{best_gc})"
     print(f"  ── Promotion eval g{game_count} vs {label} ──", flush=True)
-    opp_model.load_weights(BEST_WEIGHTS_FILE)
+    if not _load_weights_optional(
+        opp_model, BEST_WEIGHTS_FILE, role="best checkpoint for promotion eval"
+    ):
+        print("  Promotion eval skipped: best checkpoint is incompatible.", flush=True)
+        return None
     return run_match_sequential(
         model, opp_model, label,
         openings=eval_openings,
@@ -1349,6 +1409,8 @@ def _run_promotion_eval(model, game_count, all_openings, best_state, opp_model,
     result = _run_promotion_match(
         model, game_count, all_openings, best_gc, opp_model
     )
+    if result is None:
+        return best_state
     cand_rating_delta = _apply_promotion_rating_update(
         glicko2_table, cp_file, best_state, result
     )
@@ -1384,7 +1446,7 @@ def _setup_training_run():
     else:
         print("WARNING: No GPU detected — training will be slow.")
 
-    model = create_model()
+    model = _create_train_model()
     optimizer = keras.optimizers.AdamW(learning_rate=LR, weight_decay=WEIGHT_DECAY)
 
     os.makedirs("weights", exist_ok=True)
@@ -1394,7 +1456,7 @@ def _setup_training_run():
 
     # Resume automatically from checkpoint if available.
     if os.path.exists(weights_file):
-        model.load_weights(weights_file)
+        _load_weights_strict(model, weights_file, role="main training")
         starting_game, lr_state, eval_state = _load_training_state(
             model, optimizer, replay)
         print("  Loaded existing weights.\n")
@@ -1417,7 +1479,8 @@ def _setup_training_run():
     )
     warmup_fast = _scaled_budget_for_sims(MCTS_SIMS_WARMUP, PCAP_FAST_SIMS)
     warmup_weak = _scaled_budget_for_sims(MCTS_SIMS_WARMUP, ASYM_WEAK_SIMS)
-    print(f"Model: {NUM_INPUT_PLANES}ch input, 6 res-blocks × 128 filters + SE, "
+    print(f"Model: {NUM_INPUT_PLANES}ch input, {TRAIN_NUM_RES_BLOCKS} res-blocks × "
+          f"{TRAIN_NUM_FILTERS} filters + SE, "
           f"{total:,} parameters")
     print(f"MCTS: {MCTS_SIMS} full / {PCAP_FAST_SIMS} fast sims "
           f"({PCAP_FULL_FRAC:.0%} full), batch size {MCTS_BATCH_SIZE} (GPU)")
@@ -1477,10 +1540,10 @@ def _setup_training_run():
     plateau = PlateauDetector(
         window=80,
         check_every=10,
-        warmup_batches=500,         # ~500 games before detection starts
+        warmup_batches=800,         # ~800 games before detection starts
         slope_rel_thresh=3e-4,
         v_improve_rel=5e-4,
-        min_replay=20_000,
+        min_replay=40_000,
         cooldown=50,
         persist=3,
     )
@@ -1512,19 +1575,25 @@ def _setup_training_run():
         print("No best checkpoint yet — run eval_tournament.py to create one.")
 
     # Reusable opponent model for eval (swap weights per matchup)
-    opp_model = create_model()
+    opp_model = _create_train_model()
 
     # Best-opponent model for self-play (if best checkpoint exists)
     best_model = None
     best_predict_fn = None
     if os.path.exists(BEST_WEIGHTS_FILE):
-        best_model = create_model()
-        best_model.load_weights(BEST_WEIGHTS_FILE)
-        best_predict_fn = make_predict_fn(best_model)
-        best_predict_fn(np.zeros((1, BOARD_SIZE, BOARD_SIZE, NUM_INPUT_PLANES),
-                                 dtype=np.float32))
-        print(f"Best-opponent loaded from {BEST_WEIGHTS_FILE} "
-              f"(g{best_state.get('game_count', '?')})")
+        best_model = _create_train_model()
+        if _load_weights_optional(
+            best_model, BEST_WEIGHTS_FILE, role="best-opponent checkpoint"
+        ):
+            best_predict_fn = make_predict_fn(best_model)
+            best_predict_fn(np.zeros((1, BOARD_SIZE, BOARD_SIZE, NUM_INPUT_PLANES),
+                                     dtype=np.float32))
+            print(f"Best-opponent loaded from {BEST_WEIGHTS_FILE} "
+                  f"(g{best_state.get('game_count', '?')})")
+        else:
+            best_model = None
+            best_predict_fn = None
+            print("Best-opponent disabled until a compatible best checkpoint exists.")
     else:
         print("No best checkpoint — vs-best games disabled until tournament promotion")
     print()
@@ -1835,8 +1904,11 @@ def _apply_train_feedback_updates(
 
 def _load_best_predict_fn(best_model):
     if best_model is None:
-        best_model = create_model()
-    best_model.load_weights(BEST_WEIGHTS_FILE)
+        best_model = _create_train_model()
+    if not _load_weights_optional(
+        best_model, BEST_WEIGHTS_FILE, role="best-opponent checkpoint"
+    ):
+        return None, None
     best_predict_fn = make_predict_fn(best_model)
     best_predict_fn(np.zeros(
         (1, BOARD_SIZE, BOARD_SIZE, NUM_INPUT_PLANES),

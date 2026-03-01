@@ -42,6 +42,7 @@ from gomoku import (
     GomokuGame, create_model, make_predict_fn,
     mcts_search_batched, mcts_policy,
 )
+from entrypoint_shared import MODEL_ARCH_CANDIDATES
 from book_openings import (
     EVAL_OPENING_PLIES,
     EVAL_OPENING_SEED,
@@ -61,6 +62,35 @@ from ratings_glicko2 import (
 EVAL_SIMS         = 100    # MCTS simulations per move (same for both sides)
 EVAL_BATCH_SIZE   = 8      # MCTS batch size
 EVAL_GAMES        = 200    # games per matchup (100 openings × 2 color swaps)
+
+
+def _create_model_for_arch(arch):
+    num_res_blocks, num_filters = arch
+    return create_model(
+        num_res_blocks=num_res_blocks,
+        num_filters=num_filters,
+    )
+
+
+def _load_model_with_arch_fallback(weight_path):
+    errors = []
+    for arch in MODEL_ARCH_CANDIDATES:
+        model = _create_model_for_arch(arch)
+        try:
+            model.load_weights(weight_path)
+            return model, arch
+        except Exception as e:
+            reason = str(e).splitlines()[0] if str(e) else type(e).__name__
+            errors.append(f"{arch[0]}x{arch[1]}: {reason}")
+
+    details = "; ".join(errors) if errors else "no loader attempts"
+    raise ValueError(
+        f"Unable to load weights '{weight_path}'. Tried architectures: {details}"
+    )
+
+
+def _format_arch(arch):
+    return f"{arch[0]}x{arch[1]}"
 
 
 def _parse_sim_levels(spec):
@@ -553,14 +583,13 @@ def _run_standard_eval_matches(
     no_rating_update,
     candidate_key,
 ):
-    # Reusable opponent model (swap weights per matchup)
-    opp_model = create_model()
     ratings_table = load_glicko2_ratings()
     ratings_changed = False
 
     all_results = []
     for label, opp_path in opponents:
-        opp_model.load_weights(opp_path)
+        opp_model, opp_arch = _load_model_with_arch_fallback(opp_path)
+        print(f"  Opponent net: {_format_arch(opp_arch)}  ({opp_path})")
         result = run_match_sequential(
             candidate_model,
             opp_model,
@@ -644,8 +673,8 @@ def main():
     openings, n_games = _load_eval_openings(args)
 
     _print_eval_gpu_status()
-    candidate_model = create_model()
-    candidate_model.load_weights(candidate["path"])
+    candidate_model, candidate_arch = _load_model_with_arch_fallback(candidate["path"])
+    print(f"Candidate net: {_format_arch(candidate_arch)}")
 
     if args.calibrate_sims:
         _run_sims_calibration(
