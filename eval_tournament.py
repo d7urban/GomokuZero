@@ -42,7 +42,7 @@ TOURNEY_SWISS_OPENINGS = 4   # 8 games per pairing per round
 TOURNEY_SWISS_ROUNDS = 6
 
 # McMahon final stage (top bar-selected players)
-TOURNEY_MCM_SIMS = 100
+TOURNEY_MCM_SIMS = 160
 TOURNEY_MCM_OPENINGS = 8     # 16 games per pairing per round
 TOURNEY_MCM_ROUNDS = 5
 TOURNEY_MCM_BAR_GAP = 80.0   # include players within this rating gap from leader
