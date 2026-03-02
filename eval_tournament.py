@@ -42,11 +42,13 @@ from ratings_glicko2 import (
 TOURNEY_SWISS_SIMS = 50
 TOURNEY_SWISS_OPENINGS = 4   # 8 games per pairing per round
 TOURNEY_SWISS_ROUNDS = 6
+TOURNEY_SWISS_BATCH_SIZE = 16
 
 # McMahon final stage (top bar-selected players)
 TOURNEY_MCM_SIMS = 160
 TOURNEY_MCM_OPENINGS = 8     # 16 games per pairing per round
 TOURNEY_MCM_ROUNDS = 5
+TOURNEY_MCM_BATCH_SIZE = 8
 TOURNEY_MCM_BAR_GAP = 80.0   # include players within this rating gap from leader
 TOURNEY_MCM_MIN_PLAYERS = 8
 TOURNEY_MCM_MAX_PLAYERS = 24
@@ -198,7 +200,7 @@ def _default_tournament_output_paths(tournament_dir):
     }
 
 
-def _build_config(args):
+def _build_config(args, eval_batch_size):
     defaults = _default_tournament_output_paths(getattr(args, "tournament_dir", None))
     ratings_file = getattr(args, "ratings_file", None) or defaults["ratings_file"]
     best_weights_file = (
@@ -207,13 +209,21 @@ def _build_config(args):
     best_state_file = (
         getattr(args, "best_state_file", None) or defaults["best_state_file"]
     )
+    swiss_batch_size = max(
+        1, int(_cfg(args, "swiss_batch_size", TOURNEY_SWISS_BATCH_SIZE))
+    )
+    mcmahon_batch_size = max(
+        1, int(_cfg(args, "mcmahon_batch_size", TOURNEY_MCM_BATCH_SIZE))
+    )
     return {
         "swiss_sims": _cfg(args, "swiss_sims", TOURNEY_SWISS_SIMS),
         "swiss_openings": _cfg(args, "swiss_openings", TOURNEY_SWISS_OPENINGS),
         "swiss_rounds": _cfg(args, "swiss_rounds", TOURNEY_SWISS_ROUNDS),
+        "swiss_batch_size": swiss_batch_size,
         "mcmahon_sims": _cfg(args, "mcmahon_sims", TOURNEY_MCM_SIMS),
         "mcmahon_openings": _cfg(args, "mcmahon_openings", TOURNEY_MCM_OPENINGS),
         "mcmahon_rounds": _cfg(args, "mcmahon_rounds", TOURNEY_MCM_ROUNDS),
+        "mcmahon_batch_size": mcmahon_batch_size,
         "mcmahon_bar_gap": float(_cfg(args, "mcmahon_bar_gap", TOURNEY_MCM_BAR_GAP)),
         "mcmahon_min_players": int(
             _cfg(args, "mcmahon_min_players", TOURNEY_MCM_MIN_PLAYERS)
@@ -580,7 +590,7 @@ def _run_pairing_stage(
     sims,
     openings_per_round,
     run_match_fn,
-    eval_batch_size,
+    stage_batch_size,
     ratings_table,
     initial_stats=None,
     seed_played_pairs=None,
@@ -599,7 +609,8 @@ def _run_pairing_stage(
         ordered = _ordered_players(stage_paths, stats, ratings_table)
         pairs, bye_path = _pair_round_players(ordered, stats, played_pairs)
         print(f"\n{stage_name} round {round_idx}/{rounds} "
-              f"@ {sims} sims, {len(round_openings) * 2} games/pairing")
+              f"@ {sims} sims, batch {stage_batch_size}, "
+              f"{len(round_openings) * 2} games/pairing")
         print(f"  Pairings: {len(pairs)}")
         if bye_path:
             _award_bye(stats, bye_path)
@@ -616,7 +627,7 @@ def _run_pairing_stage(
                 right_path=right_path,
                 round_openings=round_openings,
                 sims=sims,
-                eval_batch_size=eval_batch_size,
+                eval_batch_size=stage_batch_size,
                 run_match_fn=run_match_fn,
                 ratings_table=ratings_table,
                 stage_stats=stats,
@@ -744,9 +755,11 @@ def _print_gpu_status_local():
 def _print_tournament_config(config):
     print("Tournament format:")
     print(f"  Swiss seeding:  {config['swiss_rounds']} rounds  "
-          f"@ {config['swiss_sims']} sims, {config['swiss_openings'] * 2} games/pairing")
+          f"@ {config['swiss_sims']} sims, batch {config['swiss_batch_size']}, "
+          f"{config['swiss_openings'] * 2} games/pairing")
     print(f"  McMahon final:  {config['mcmahon_rounds']} rounds  "
-          f"@ {config['mcmahon_sims']} sims, {config['mcmahon_openings'] * 2} games/pairing")
+          f"@ {config['mcmahon_sims']} sims, batch {config['mcmahon_batch_size']}, "
+          f"{config['mcmahon_openings'] * 2} games/pairing")
     print(f"  McMahon bar gap: {config['mcmahon_bar_gap']:.1f} rating points")
     print(f"  McMahon field:   min {config['mcmahon_min_players']} / "
           f"max {config['mcmahon_max_players']} players")
@@ -829,11 +842,13 @@ def _format_summary_markdown(summary):
         (
             f"- Swiss: {summary['config']['swiss_rounds']} rounds, "
             f"{summary['config']['swiss_sims']} sims, "
+            f"batch {summary['config']['swiss_batch_size']}, "
             f"{summary['config']['swiss_openings'] * 2} games/pairing"
         ),
         (
             f"- McMahon: {summary['config']['mcmahon_rounds']} rounds, "
             f"{summary['config']['mcmahon_sims']} sims, "
+            f"batch {summary['config']['mcmahon_batch_size']}, "
             f"{summary['config']['mcmahon_openings'] * 2} games/pairing"
         ),
         "",
@@ -891,9 +906,11 @@ def _write_tournament_summary(
             "swiss_rounds": int(config["swiss_rounds"]),
             "swiss_sims": int(config["swiss_sims"]),
             "swiss_openings": int(config["swiss_openings"]),
+            "swiss_batch_size": int(config["swiss_batch_size"]),
             "mcmahon_rounds": int(config["mcmahon_rounds"]),
             "mcmahon_sims": int(config["mcmahon_sims"]),
             "mcmahon_openings": int(config["mcmahon_openings"]),
+            "mcmahon_batch_size": int(config["mcmahon_batch_size"]),
             "mcmahon_bar_gap": float(config["mcmahon_bar_gap"]),
             "mcmahon_min_players": int(config["mcmahon_min_players"]),
             "mcmahon_max_players": int(config["mcmahon_max_players"]),
@@ -949,7 +966,7 @@ def _write_tournament_summary(
 
 def run_tournament(args, run_match_fn, eval_batch_size, print_gpu_status_fn=None):
     """Run Swiss + McMahon tournament over all weights in args.tournament_dir."""
-    config = _build_config(args)
+    config = _build_config(args, eval_batch_size)
     discovered = find_weight_files(args.tournament_dir)
     if len(discovered) < 2:
         print(f"Need at least two weights in {args.tournament_dir}; found {len(discovered)}")
@@ -989,7 +1006,7 @@ def run_tournament(args, run_match_fn, eval_batch_size, print_gpu_status_fn=None
         sims=config["swiss_sims"],
         openings_per_round=config["swiss_openings"],
         run_match_fn=run_match_fn,
-        eval_batch_size=eval_batch_size,
+        stage_batch_size=config["swiss_batch_size"],
         ratings_table=ratings_table,
     )
     ratings_table = swiss["ratings_table"]
@@ -1019,7 +1036,7 @@ def run_tournament(args, run_match_fn, eval_batch_size, print_gpu_status_fn=None
         sims=config["mcmahon_sims"],
         openings_per_round=config["mcmahon_openings"],
         run_match_fn=run_match_fn,
-        eval_batch_size=eval_batch_size,
+        stage_batch_size=config["mcmahon_batch_size"],
         ratings_table=ratings_table,
         seed_played_pairs=seeded_pairs,
     )
@@ -1086,6 +1103,8 @@ def _build_tournament_parser():
     parser.add_argument("--swiss-openings", type=int, default=TOURNEY_SWISS_OPENINGS,
                         help=f"Swiss openings per round "
                              f"(default: {TOURNEY_SWISS_OPENINGS})")
+    parser.add_argument("--swiss-batch-size", type=int, default=TOURNEY_SWISS_BATCH_SIZE,
+                        help=f"Swiss MCTS batch size (default: {TOURNEY_SWISS_BATCH_SIZE})")
 
     parser.add_argument("--mcmahon-rounds", type=int, default=TOURNEY_MCM_ROUNDS,
                         help=f"McMahon rounds (default: {TOURNEY_MCM_ROUNDS})")
@@ -1094,6 +1113,8 @@ def _build_tournament_parser():
     parser.add_argument("--mcmahon-openings", type=int, default=TOURNEY_MCM_OPENINGS,
                         help=f"McMahon openings per round "
                              f"(default: {TOURNEY_MCM_OPENINGS})")
+    parser.add_argument("--mcmahon-batch-size", type=int, default=TOURNEY_MCM_BATCH_SIZE,
+                        help=f"McMahon MCTS batch size (default: {TOURNEY_MCM_BATCH_SIZE})")
     parser.add_argument("--mcmahon-bar-gap", type=float, default=TOURNEY_MCM_BAR_GAP,
                         help=f"Bar gap from leader rating "
                              f"(default: {TOURNEY_MCM_BAR_GAP:.1f})")
