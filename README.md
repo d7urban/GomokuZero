@@ -120,6 +120,7 @@ bar, and writes outputs inside the tournament folder by default:
 `<tournament-dir>/glicko2_ratings.pkl`,
 `<tournament-dir>/gomoku_best.weights.h5`,
 `<tournament-dir>/best_checkpoint.pkl`.
+Default tournament sims are `--swiss-sims 50` and `--mcmahon-sims 160`.
 Tournament discovery automatically excludes
 `gomoku_best.weights.h5`, `gomoku_weights.weights.h5`, and
 `gomoku_*_final.weights.h5`.
