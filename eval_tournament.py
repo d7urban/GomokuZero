@@ -13,10 +13,12 @@ Usage:
 
 import argparse
 import glob
+import json
 import os
 import pickle
 import re
 import shutil
+from datetime import datetime, timezone
 
 from book_openings import (
     EVAL_OPENING_PLIES,
@@ -52,6 +54,7 @@ TOURNEY_MCM_MAX_PLAYERS = 24
 # Practical tie policy for champion decision
 TOURNEY_SHARED_GOLD_MARGIN = 0.02
 TOURNEY_SHARED_GOLD_MIN_GAMES = 120
+TOURNEY_SUMMARY_DIR = "tournament_summaries"
 
 # Keep canonical live pointers out of tournament pools.
 TOURNEY_EXCLUDED_BASENAMES = {
@@ -789,6 +792,161 @@ def _print_tournament_final(final):
         print(f"    ... +{len(rows) - len(shown)} more")
 
 
+def _summarize_standings_rows(rows):
+    out = []
+    for i, row in enumerate(rows, 1):
+        out.append({
+            "rank": int(i),
+            "path": row["path"],
+            "file": os.path.basename(row["path"]),
+            "score": float(row["score"]),
+            "gp_rate": float(row["gp_rate"]),
+            "games": int(row["games"]),
+            "rounds": int(row["rounds"]),
+            "rating": float(row["rating"]),
+            "rd": float(row["rd"]),
+        })
+    return out
+
+
+def _arch_histogram(weight_paths, arch_by_path):
+    hist = {}
+    for path in weight_paths:
+        arch = arch_by_path.get(path)
+        key = _format_arch(arch) if arch is not None else "unknown"
+        hist[key] = int(hist.get(key, 0)) + 1
+    return hist
+
+
+def _format_summary_markdown(summary):
+    lines = [
+        "# Tournament Summary",
+        "",
+        f"- UTC: {summary['timestamp_utc']}",
+        f"- Tournament dir: {summary['tournament_dir']}",
+        "",
+        "## Format",
+        (
+            f"- Swiss: {summary['config']['swiss_rounds']} rounds, "
+            f"{summary['config']['swiss_sims']} sims, "
+            f"{summary['config']['swiss_openings'] * 2} games/pairing"
+        ),
+        (
+            f"- McMahon: {summary['config']['mcmahon_rounds']} rounds, "
+            f"{summary['config']['mcmahon_sims']} sims, "
+            f"{summary['config']['mcmahon_openings'] * 2} games/pairing"
+        ),
+        "",
+        "## Field",
+        f"- Discovered files: {summary['field']['discovered_files']}",
+        f"- Compatible files: {summary['field']['compatible_files']}",
+        (
+            "- Architectures: "
+            + ", ".join(
+                f"{k}={v}" for k, v in sorted(summary["field"]["architectures"].items())
+            )
+        ),
+        "",
+        "## Result",
+        f"- Champion: {summary['result']['winner_file'] or '(shared gold/no single winner)'}",
+        f"- Shared gold: {'yes' if summary['result']['shared_gold'] else 'no'}",
+        f"- Promoted checkpoint: {summary['result']['promoted_file'] or '(none)'}",
+        "",
+        "## Final McMahon Standings",
+        "| # | Checkpoint | Score | GP | Rating | RD |",
+        "|---:|---|---:|---:|---:|---:|",
+    ]
+
+    for row in summary["standings"]:
+        lines.append(
+            f"| {row['rank']} | {row['file']} | {row['score']:.1f} | "
+            f"{row['gp_rate']:.3f} | {row['rating']:.0f} | {row['rd']:.0f} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _write_tournament_summary(
+    args,
+    config,
+    final,
+    discovered,
+    weight_paths,
+    arch_by_path,
+    promoted_path,
+):
+    tournament_dir = os.path.normpath(str(args.tournament_dir))
+    summary_dir = os.path.join(tournament_dir, TOURNEY_SUMMARY_DIR)
+    os.makedirs(summary_dir, exist_ok=True)
+
+    ts_utc = datetime.now(timezone.utc)
+    ts_tag = ts_utc.strftime("%Y%m%d_%H%M%SZ")
+    standings = _summarize_standings_rows(final.get("rows") or [])
+    winner = final.get("winner")
+    shared_gold_rows = final.get("shared_gold_paths") or []
+
+    summary = {
+        "timestamp_utc": ts_utc.isoformat().replace("+00:00", "Z"),
+        "tournament_dir": tournament_dir,
+        "config": {
+            "swiss_rounds": int(config["swiss_rounds"]),
+            "swiss_sims": int(config["swiss_sims"]),
+            "swiss_openings": int(config["swiss_openings"]),
+            "mcmahon_rounds": int(config["mcmahon_rounds"]),
+            "mcmahon_sims": int(config["mcmahon_sims"]),
+            "mcmahon_openings": int(config["mcmahon_openings"]),
+            "mcmahon_bar_gap": float(config["mcmahon_bar_gap"]),
+            "mcmahon_min_players": int(config["mcmahon_min_players"]),
+            "mcmahon_max_players": int(config["mcmahon_max_players"]),
+        },
+        "field": {
+            "discovered_files": int(len(discovered)),
+            "compatible_files": int(len(weight_paths)),
+            "architectures": _arch_histogram(weight_paths, arch_by_path),
+        },
+        "result": {
+            "winner_path": winner,
+            "winner_file": os.path.basename(winner) if winner else None,
+            "shared_gold": bool(final.get("shared_gold", False)),
+            "shared_gold_files": [
+                os.path.basename(row["path"]) for row in shared_gold_rows
+            ],
+            "shared_gold_paths": [row["path"] for row in shared_gold_rows],
+            "promoted_path": promoted_path,
+            "promoted_file": (
+                os.path.basename(promoted_path) if promoted_path else None
+            ),
+        },
+        "standings": standings,
+    }
+
+    json_name = f"tournament_{ts_tag}.json"
+    md_name = f"tournament_{ts_tag}.md"
+    json_path = os.path.join(summary_dir, json_name)
+    md_path = os.path.join(summary_dir, md_name)
+    latest_json = os.path.join(summary_dir, "latest.json")
+    latest_md = os.path.join(summary_dir, "latest.md")
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(_format_summary_markdown(summary))
+    with open(latest_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+    with open(latest_md, "w", encoding="utf-8") as f:
+        f.write(_format_summary_markdown(summary))
+
+    print("Saved tournament summary:")
+    print(f"  JSON: {json_path}")
+    print(f"  MD:   {md_path}")
+
+    return {
+        "json": json_path,
+        "markdown": md_path,
+        "latest_json": latest_json,
+        "latest_markdown": latest_md,
+    }
+
+
 def run_tournament(args, run_match_fn, eval_batch_size, print_gpu_status_fn=None):
     """Run Swiss + McMahon tournament over all weights in args.tournament_dir."""
     config = _build_config(args)
@@ -887,11 +1045,26 @@ def run_tournament(args, run_match_fn, eval_batch_size, print_gpu_status_fn=None
         else:
             print("Best checkpoint not updated (no champion resolved).")
 
+    summary_files = None
+    try:
+        summary_files = _write_tournament_summary(
+            args=args,
+            config=config,
+            final=final,
+            discovered=discovered,
+            weight_paths=weight_paths,
+            arch_by_path=arch_by_path,
+            promoted_path=promoted_path,
+        )
+    except Exception as e:
+        print(f"Warning: failed to write tournament summary: {e}")
+
     return {
         "final": final,
         "ratings_table": ratings_table,
         "promoted_path": promoted_path,
         "best_state": best_state,
+        "summary_files": summary_files,
     }
 
 
