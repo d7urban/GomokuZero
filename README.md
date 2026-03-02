@@ -58,6 +58,20 @@ Training parameters can be adjusted in `train.py`. The script will:
 - Keep plateau/autotune safeguards in-loop (inline eval/promotion disabled by default)
 - Hand off checkpoint ranking/promotion to manual tournament runs
 
+Runtime tuning is also available via environment variables (current defaults):
+- `GZ_CONCURRENT_GAMES=24`
+- `GZ_NUM_GAMES=5000`
+- `GZ_BATCH_SIZE=1024`
+- `GZ_TRAIN_STEPS_RATIO=4.0`
+- `GZ_MCTS_BATCH_SIZE=10` (full-search moves)
+- `GZ_MCTS_BATCH_SIZE_FAST=16` (fast/value-only moves)
+
+Example:
+
+```bash
+GZ_CONCURRENT_GAMES=28 GZ_MCTS_BATCH_SIZE_FAST=20 python train.py
+```
+
 Run the training+tournament cycle until a total game goal:
 
 ```bash
@@ -180,8 +194,8 @@ python play_qt.py
   - Plane 5: opponent open-three threat cells
 - **Backbone**:
   - 3×3 conv stem, 128 channels, BN, ReLU
-  - 6 residual blocks (each: 3×3 conv -> BN -> ReLU -> 3×3 conv -> BN -> skip add -> ReLU)
-  - Squeeze-and-Excitation on every other residual block (blocks 2, 4, 6)
+  - 10 residual blocks (each: 3×3 conv -> BN -> ReLU -> 3×3 conv -> BN -> skip add -> ReLU)
+  - Squeeze-and-Excitation on every other residual block (blocks 2, 4, 6, 8, 10)
 - **Policy head**:
   - 1×1 conv (2 channels) -> BN -> ReLU -> Flatten -> Dense(225)
   - Outputs raw logits for all board cells (no softmax in-model; masking/softmax is applied in MCTS/training)

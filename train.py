@@ -48,9 +48,32 @@ from ratings_glicko2 import (
     save_glicko2_ratings,
 )
 
+
+def _env_int(name, default, min_value=1):
+    raw = os.environ.get(name)
+    if raw is None:
+        return int(default)
+    try:
+        val = int(raw)
+    except Exception:
+        return int(default)
+    return max(int(min_value), val)
+
+
+def _env_float(name, default, min_value=0.0):
+    raw = os.environ.get(name)
+    if raw is None:
+        return float(default)
+    try:
+        val = float(raw)
+    except Exception:
+        return float(default)
+    return max(float(min_value), val)
+
+
 # ── Tunables ────────────────────────────────────────────────────────────────
-CONCURRENT_GAMES  = 20           # games interleaved on GPU simultaneously
-NUM_GAMES         = 5000         # total self-play games
+CONCURRENT_GAMES  = _env_int("GZ_CONCURRENT_GAMES", 24)  # interleaved games per batch
+NUM_GAMES         = _env_int("GZ_NUM_GAMES", 5000)       # total self-play games
 TRAIN_NUM_RES_BLOCKS = 10        # fixed training architecture (10x128)
 TRAIN_NUM_FILTERS = 128
 C_PUCT            = 1.5
@@ -59,11 +82,13 @@ NOISE_FRAC_START  = 0.35         # Dirichlet noise fraction (anneals down)
 NOISE_FRAC_END    = 0.25         # noise floor after NOISE_DECAY_GAMES
 NOISE_DECAY_GAMES = 3000         # linear anneal over this many games
 TEMP_THRESHOLD    = 40           # move number after which temperature drops
-BATCH_SIZE        = 1024
+BATCH_SIZE        = _env_int("GZ_BATCH_SIZE", 1024)
 REPLAY_SIZE       = 300_000      # positions — larger to reduce forgetting
 REPLAY_RECENT_FRAC = 0.75       # fraction of each batch from recent positions
 REPLAY_RECENT_SIZE = 50_000     # how many most-recent positions count as "recent"
-TRAIN_STEPS_RATIO = 4.0          # gradient steps = new_positions * ratio / BATCH_SIZE
+TRAIN_STEPS_RATIO = _env_float(
+    "GZ_TRAIN_STEPS_RATIO", 4.0, min_value=0.01
+)  # gradient steps = new_positions * ratio / BATCH_SIZE
 LR                = 7e-4
 WEIGHT_DECAY      = 1e-4
 VALUE_LOSS_COEFF  = 1.0          # weight on value loss (tune if v-loss dominates)
@@ -73,7 +98,10 @@ EVAL_INTERVAL     = 200          # games between diagnostic/promotion checks
 # Batched MCTS — leaves evaluated per forward pass.
 # Smaller batches = more backup rounds = better-informed UCB selection.
 # GPU handles batch-8 in ~1ms so throughput is not the bottleneck.
-MCTS_BATCH_SIZE   = 10
+MCTS_BATCH_SIZE   = _env_int("GZ_MCTS_BATCH_SIZE", 10)
+# Value-only moves (fast/weak/resigned) can use larger leaf batches to
+# reduce forward-pass rounds without affecting policy targets.
+MCTS_BATCH_SIZE_FAST = _env_int("GZ_MCTS_BATCH_SIZE_FAST", 16)
 
 # Self-play simulation budget
 MCTS_SIMS         = 160          # full-search sims (for policy training)
@@ -659,6 +687,49 @@ _STATE_PATH  = "weights/train_state.pkl"
 _REPLAY_PATH = "weights/replay_buffer.pkl"
 
 
+class ReplayBuffer:
+    """Fixed-capacity ring buffer with O(1) append and indexing."""
+
+    def __init__(self, capacity):
+        self.capacity = max(1, int(capacity))
+        self._data = [None] * self.capacity
+        self._start = 0
+        self._size = 0
+
+    def __len__(self):
+        return self._size
+
+    def append(self, item):
+        if self._size < self.capacity:
+            idx = (self._start + self._size) % self.capacity
+            self._data[idx] = item
+            self._size += 1
+            return
+        self._data[self._start] = item
+        self._start = (self._start + 1) % self.capacity
+
+    def __getitem__(self, index):
+        i = int(index)
+        if i < 0:
+            i += self._size
+        if i < 0 or i >= self._size:
+            raise IndexError(index)
+        return self._data[(self._start + i) % self.capacity]
+
+    def __iter__(self):
+        for i in range(self._size):
+            yield self._data[(self._start + i) % self.capacity]
+
+    def to_list(self):
+        if self._size == 0:
+            return []
+        end = self._start + self._size
+        if end <= self.capacity:
+            return list(self._data[self._start:end])
+        split = self.capacity - self._start
+        return list(self._data[self._start:]) + list(self._data[:self._size - split])
+
+
 def _train_arch_label():
     return f"{TRAIN_NUM_RES_BLOCKS}x{TRAIN_NUM_FILTERS}"
 
@@ -734,7 +805,11 @@ def _save_training_state(game_count, optimizer, replay, lr_scheduler=None,
         pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     with open(_REPLAY_PATH, "wb") as f:
-        pickle.dump(list(replay), f, protocol=pickle.HIGHEST_PROTOCOL)
+        if hasattr(replay, "to_list"):
+            replay_dump = replay.to_list()
+        else:
+            replay_dump = list(replay)
+        pickle.dump(replay_dump, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     with open("weights/model_config.pkl", "wb") as f:
         pickle.dump(
@@ -810,6 +885,9 @@ class _InterleavedGame:
         "resign_count", "vs_best", "training_player",
         "is_full_search", "soft_resigned",
     )
+
+
+_ZERO_POLICY = np.zeros((BOARD_SIZE * BOARD_SIZE,), dtype=np.float32)
 
 
 def _interleaved_is_best_turn(game_state):
@@ -893,10 +971,11 @@ def _set_interleaved_move_budget(game_state, is_best_turn):
 def _queue_interleaved_new_move(game_state, bundle, noise_frac, is_best_turn):
     _set_interleaved_move_budget(game_state, is_best_turn)
     add_noise = (not is_best_turn) and game_state.is_full_search
+    batch_size = MCTS_BATCH_SIZE if game_state.is_full_search else MCTS_BATCH_SIZE_FAST
     game_state.ctx, game_state.root_state = mcts_begin(
         game_state.game,
         num_simulations=game_state.move_sims,
-        batch_size=MCTS_BATCH_SIZE,
+        batch_size=batch_size,
         c_puct=C_PUCT,
         add_noise=add_noise,
         dirichlet_alpha=DIRICHLET_ALPHA,
@@ -938,7 +1017,13 @@ def _run_interleaved_eval_bundle(bundle, predict_fn):
     if not bundle["states"]:
         return
 
-    batch = np.array(bundle["states"], dtype=np.float32)
+    states = bundle["states"]
+    if len(states) == 1:
+        batch = states[0][np.newaxis, ...]
+    else:
+        batch = np.stack(states, axis=0)
+    if batch.dtype != np.float32:
+        batch = batch.astype(np.float32, copy=False)
     logits_np, values_np = predict_fn(batch)
     values_np = values_np.ravel()
 
@@ -1022,17 +1107,18 @@ def _advance_interleaved_completed_games(active_games):
         root = game_state.ctx["root"]
         is_best_turn = _interleaved_is_best_turn(game_state)
         temp = _interleaved_temperature(game_state, is_best_turn)
-        pi = mcts_policy(root, temperature=temp)
+        pi_play = mcts_policy(root, temperature=temp)
+        pi_train = pi_play if game_state.is_full_search else _ZERO_POLICY
         game_state.trajectory.append((
             game_state.root_state,
-            pi,
+            pi_train,
             game_state.game.current_player,
             game_state.move_sims,
             game_state.is_full_search,
             game_state.sims,
         ))
         _update_interleaved_soft_resign(game_state, root, is_best_turn)
-        _apply_interleaved_action(game_state, root, pi)
+        _apply_interleaved_action(game_state, root, pi_play)
         game_state.ctx = None
 
 
@@ -1452,7 +1538,7 @@ def _setup_training_run():
     os.makedirs("weights", exist_ok=True)
     weights_file = "weights/gomoku_weights.weights.h5"
     starting_game = 0
-    replay = deque(maxlen=REPLAY_SIZE)
+    replay = ReplayBuffer(REPLAY_SIZE)
 
     # Resume automatically from checkpoint if available.
     if os.path.exists(weights_file):
@@ -1483,7 +1569,8 @@ def _setup_training_run():
           f"{TRAIN_NUM_FILTERS} filters + SE, "
           f"{total:,} parameters")
     print(f"MCTS: {MCTS_SIMS} full / {PCAP_FAST_SIMS} fast sims "
-          f"({PCAP_FULL_FRAC:.0%} full), batch size {MCTS_BATCH_SIZE} (GPU)")
+          f"({PCAP_FULL_FRAC:.0%} full), "
+          f"batch size {MCTS_BATCH_SIZE} full / {MCTS_BATCH_SIZE_FAST} fast (GPU)")
     if warmup_enabled:
         print(f"MCTS warmup: {MCTS_SIMS_WARMUP} full / {warmup_fast} fast / {warmup_weak} weak "
               f"until replay reaches {MCTS_SIMS_WARMUP_REPLAY:,} positions")
@@ -1778,6 +1865,23 @@ def _ingest_self_play_results(results, replay, game_count, target):
 
 
 def _run_training_updates(model, optimizer, replay, new_positions):
+    def _build_train_batch_arrays(replay_buf, idxs):
+        batch_n = len(idxs)
+        s = np.empty(
+            (batch_n, BOARD_SIZE, BOARD_SIZE, NUM_INPUT_PLANES),
+            dtype=np.float32,
+        )
+        p = np.empty((batch_n, BOARD_SIZE * BOARD_SIZE), dtype=np.float32)
+        v = np.empty((batch_n,), dtype=np.float32)
+        w = np.empty((batch_n,), dtype=np.float32)
+        for j, ridx in enumerate(idxs):
+            state, pi, outcome, pi_w = replay_buf[int(ridx)]
+            s[j] = state
+            p[j] = pi
+            v[j] = outcome
+            w[j] = pi_w
+        return s, p, v, w
+
     t1 = time.time()
     n_steps = max(1, int(new_positions * TRAIN_STEPS_RATIO / BATCH_SIZE))
     total_ploss = total_vloss = 0.0
@@ -1790,11 +1894,7 @@ def _run_training_updates(model, optimizer, replay, new_positions):
         did_train = True
         for _ in range(n_steps):
             idxs = _sample_replay(replay, BATCH_SIZE)
-            batch = [replay[i] for i in idxs]
-            s = np.array([b[0] for b in batch])
-            p = np.array([b[1] for b in batch])
-            v = np.array([b[2] for b in batch])
-            w = np.array([b[3] for b in batch])
+            s, p, v, w = _build_train_batch_arrays(replay, idxs)
             s, p = _augment_batch(s, p)
             eps = 1e-12
             ent = -np.mean(np.sum(p * np.log(p + eps), axis=1))
