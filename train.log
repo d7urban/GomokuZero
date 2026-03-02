@@ -1,0 +1,48 @@
+2026-03-02 14:20:35.632760: I tensorflow/core/platform/cpu_feature_guard.cc:210] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: AVX2 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+2026-03-02 14:20:37.908694: W tensorflow/core/common_runtime/gpu/gpu_bfc_allocator.cc:47] Overriding orig_value setting because the TF_FORCE_GPU_ALLOW_GROWTH environment variable is set. Original config value was 0.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1772457637.909563 2679103 gpu_device.cc:2020] Created device /job:localhost/replica:0/task:0/device:GPU:0 with 21572 MB memory:  -> device: 0, name: NVIDIA GeForce RTX 3090, pci bus id: 0000:01:00.0, compute capability: 8.6
+2026-03-02 14:20:39.844093: I external/local_xla/xla/stream_executor/cuda/cuda_dnn.cc:473] Loaded cuDNN version 91900
+============================================================
+Gomoku — AlphaZero-style MCTS Training
+  (single-process GPU self-play + training)
+============================================================
+GPU: /physical_device:GPU:0
+  No existing weights — starting fresh.
+
+Model: 6ch input, 10 res-blocks × 128 filters + SE, 3,139,472 parameters
+MCTS: 160 full / 32 fast sims (50% full), batch size 10 full / 16 fast (GPU)
+MCTS warmup: 100 full / 20 fast / 40 weak until replay reaches 50,000 positions
+Asymmetric play: 50%→10% over 3000 games, weak side 64 sims
+Openings: 30% book, 70% random (6 plies)
+Soft resign: threshold 0.85, 5 consecutive, after move 30 (value-only, fast sims from current self-play budget; target 32)
+Cython acceleration: enabled
+Threat planes: Cython (~3μs)
+Checkpoints: save every 1000g
+Eval: inline diagnostic/promotion disabled
+      Run manual tournament after run/chunk, e.g.:
+      python eval_tournament.py --tournament-dir weights
+Concurrent games: 24, target: 10000
+Best-opponent: 20% of games vs best checkpoint
+Noise: 0.35→0.25 over 3000g
+Replay buffer: 300,000 positions, batch size: 1024, recent bias: 75% from last 50,000
+Self-play sims: warmup active (100/20/40) at replay 0/50,000
+Loss: policy + 1.0×value
+LR: 2.10e-04 → 7.00e-04 (warmup 200 batches, then tracks P-H gap, patience=7, factor=0.5, floor=3e-06)
+
+  Generated opening book: 150 balanced positions (6 plies) → weights/eval_openings.pkl
+Book openings: 296 positions (30% of games)
+No best checkpoint yet — run eval_tournament.py to create one.
+No best checkpoint — vs-best games disabled until tournament promotion
+
+Ready. (startup took 2s)
+
+Game    24/10000 | Asym 10/24 (50%) | Sims 100/20/40 | Moves  47.0 | Win 24/24 | P 5.6419 V 0.9999 w̄ 0.42 H 1.23 gap 4.415 | Buf   1128 | SP 25.4s  Tr 13.5s
+Game    48/10000 | Asym 11/24 (50%) | Sims 100/20/40 | Moves  47.6 | Win 24/24 | P 5.4984 V 0.9524 w̄ 0.40 H 1.15 gap 4.345 | Buf   2270 | SP 15.7s  Tr 1.5s
+
+
+⚠ Interrupted — saving training state …
+
+✓ State saved at game 48.  Resume with: python train.py
+  Total time: 0h 1m 7s

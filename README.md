@@ -81,7 +81,7 @@ Run the training+tournament cycle until a total game goal:
 ./train_tournament_loop.sh --games-goal 120000 --tournament-dir botb-weights -- --mcmahon-rounds 6
 ```
 
-`train_tournament_loop.sh` runs `train.py` (`NUM_GAMES` games/chunk; currently 5,000),
+`train_tournament_loop.sh` runs `train.py` (`GZ_NUM_GAMES` games/chunk; default 5,000),
 then `eval_tournament.py`, and repeats until `weights/train_state.pkl` reaches
 `--games-goal`. Both module calls in the loop run with `2>/dev/null`.
 It auto-selects Swiss rounds per cycle by tournament player count:
@@ -213,7 +213,7 @@ python play_qt.py
 - `train.py` - Self-play training loop (inline eval/promotion disabled by default)
 - `eval.py` - Checkpoint evaluation, calibration, and persistent Glicko-2 updates
 - `eval_tournament.py` - Swiss + McMahon tournament runner with persistent ratings and best-checkpoint promotion
-- `train_tournament_loop.sh` - Repeats `NUM_GAMES`-sized training chunks + tournament until a target total game count
+- `train_tournament_loop.sh` - Repeats `GZ_NUM_GAMES`-sized training chunks + tournament until a target total game count
 - `play.py` - Interactive terminal UI for human vs AI
 - `play_qt.py` - PyQt6 graphical UI (human vs AI / human vs human, analysis heatmap)
 - `book_openings.py` - Opening book for evaluation consistency

@@ -8,7 +8,7 @@ Usage:
 
 Description:
   Repeats this cycle until train_state game_count reaches --games-goal:
-    1) run train.py (uses train.py NUM_GAMES per run)
+    1) run train.py (uses effective GZ_NUM_GAMES per run; falls back to train.py default)
     2) run eval_tournament.py --tournament-dir <dir>
   Auto-sets Swiss rounds each cycle from player count in tournament dir:
     <=70 players -> 6 rounds, 71-140 -> 7 rounds, >140 -> 8 rounds
@@ -161,16 +161,38 @@ auto_swiss_rounds_for_players() {
   fi
 }
 
-train_chunk_games="$(sed -nE 's/^[[:space:]]*NUM_GAMES[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' train.py | head -n1)"
-if [[ -z "$train_chunk_games" ]]; then
-  echo "Could not parse NUM_GAMES from train.py" >&2
+resolve_train_chunk_games() {
+  "$python_bin" - <<'PY'
+import os
+import re
+from pathlib import Path
+
+text = Path("train.py").read_text(encoding="utf-8", errors="ignore")
+m = re.search(
+    r'^\s*NUM_GAMES\s*=\s*_env_int\(\s*"GZ_NUM_GAMES"\s*,\s*([0-9_]+)\s*\)',
+    text,
+    flags=re.MULTILINE,
+)
+default = int((m.group(1) if m else "5000").replace("_", ""))
+raw = os.environ.get("GZ_NUM_GAMES")
+try:
+    val = default if raw is None else int(raw)
+except Exception:
+    val = default
+print(max(1, val))
+PY
+}
+
+train_chunk_games="$(resolve_train_chunk_games)"
+if ! [[ "$train_chunk_games" =~ ^[0-9]+$ ]] || ((train_chunk_games <= 0)); then
+  echo "Could not resolve effective train chunk size (GZ_NUM_GAMES)." >&2
   exit 1
 fi
 
 current_games="$(read_game_count)"
 echo "Current games: $current_games"
 echo "Goal games: $games_goal"
-echo "Train chunk (NUM_GAMES): $train_chunk_games"
+echo "Train chunk (effective GZ_NUM_GAMES): $train_chunk_games"
 
 if ((current_games >= games_goal)); then
   echo "Goal already reached. Nothing to do."
