@@ -11,8 +11,9 @@ from libc.math cimport sqrt, exp, INFINITY
 
 np.import_array()
 
-# Capability flag consumed by gomoku.py to detect fixed select_child semantics.
+# Capability flags consumed by gomoku.py to detect fixed select_child semantics.
 SELECT_CHILD_PARENT_VIEW = 1
+SELECT_CHILD_TIEBREAK_PRIOR = 1
 
 # ── _select_child (lazy expansion) ────────────────────────────────────────
 def select_child(node, double c_puct):
@@ -23,8 +24,10 @@ def select_child(node, double c_puct):
     """
     cdef double sqrt_n = sqrt(<double>node.visit_count) if node.visit_count > 0 else 0.0
     cdef double best_score = -INFINITY
+    cdef double best_prior = -INFINITY
     cdef double ucb, q, prior_val
     cdef int vc, best_idx, i, n_moves
+    cdef double eps = 1e-12
 
     moves = node._moves
     cdef np.ndarray[np.float32_t, ndim=1] priors = node._priors
@@ -49,10 +52,14 @@ def select_child(node, double c_puct):
             q = 0.0
         prior_val = <double>priors[i]
         ucb = q + c_puct * prior_val * sqrt_n / (1.0 + <double>vc)
-        if ucb > best_score:
+        if (ucb > best_score + eps
+                or best_idx < 0
+                or ((ucb >= best_score - eps and ucb <= best_score + eps)
+                    and prior_val > best_prior + eps)):
             best_score = ucb
             best_idx = i
             best_child = child
+            best_prior = prior_val
 
     action = moves[best_idx]
     if best_child is None:

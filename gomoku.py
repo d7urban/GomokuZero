@@ -22,16 +22,19 @@ except ImportError:
     _accel = None
     _USE_ACCEL = False
 
-# select_child in older mcts_accel builds used the wrong value sign.
-# Keep other accel paths enabled, but use Python select_child unless the
-# extension advertises the fixed semantics.
+# select_child in older mcts_accel builds used the wrong value sign and
+# deterministic index-order tie-breaking. Keep other accel paths enabled,
+# but use Python select_child unless extension advertises both fixes.
 _USE_ACCEL_SELECT = _USE_ACCEL and bool(
     getattr(_accel, "SELECT_CHILD_PARENT_VIEW", 0)
+) and bool(
+    getattr(_accel, "SELECT_CHILD_TIEBREAK_PRIOR", 0)
 )
 if _USE_ACCEL and not _USE_ACCEL_SELECT:
     warnings.warn(
-        "mcts_accel missing SELECT_CHILD_PARENT_VIEW; "
-        "using Python select_child. Rebuild with setup_accel.py.",
+        "mcts_accel missing SELECT_CHILD_PARENT_VIEW and/or "
+        "SELECT_CHILD_TIEBREAK_PRIOR; using Python select_child. "
+        "Rebuild with setup_accel.py.",
         RuntimeWarning,
         stacklevel=2,
     )
@@ -553,10 +556,12 @@ def _select_child(node, c_puct):
     best_score = -1e18
     best_idx = -1
     best_child = None
+    best_prior = -1.0
     children = node.children
     moves = node._moves
     priors = node._priors
 
+    eps = 1e-12
     for i in range(len(moves)):
         child = children.get(moves[i])
         if child is not None:
@@ -567,11 +572,15 @@ def _select_child(node, c_puct):
         else:
             vc = 0
             q = 0.0
-        ucb = q + c_puct * float(priors[i]) * sqrt_n / (1 + vc)
-        if ucb > best_score:
+        prior_i = float(priors[i])
+        ucb = q + c_puct * prior_i * sqrt_n / (1 + vc)
+        if (ucb > best_score + eps
+                or (best_idx < 0)
+                or (abs(ucb - best_score) <= eps and prior_i > best_prior + eps)):
             best_score = ucb
             best_idx = i
             best_child = child
+            best_prior = prior_i
 
     action = moves[best_idx]
     if best_child is None:
@@ -970,11 +979,31 @@ def mcts_policy(root, board_size=BOARD_SIZE, temperature=1.0):
     for (r, c), child in root.children.items():
         counts[r * board_size + c] = child.visit_count
 
+    # Tie-breaker signal for equal visit counts: prefer higher root prior.
+    # This avoids deterministic index-order artifacts such as always choosing
+    # (0,0) when many moves share identical visit counts at low sim budgets.
+    prior = np.zeros(board_size * board_size, dtype=np.float64)
+    if root._moves is not None and root._priors is not None:
+        for i, (r, c) in enumerate(root._moves):
+            idx = r * board_size + c
+            if counts[idx] > 0.0:
+                prior[idx] = float(root._priors[i])
+
     if temperature < 0.01:
-        best = np.argmax(counts)
+        max_count = counts.max()
+        if max_count <= 0:
+            best = int(np.argmax(prior))
+        else:
+            best_idxs = np.flatnonzero(counts == max_count)
+            if len(best_idxs) > 1:
+                best = int(best_idxs[np.argmax(prior[best_idxs])])
+            else:
+                best = int(best_idxs[0])
         policy = np.zeros_like(counts)
         policy[best] = 1.0
     else:
+        if np.any(prior > 0.0):
+            counts = counts + (counts > 0.0) * (1e-6 * prior)
         counts = counts ** (1.0 / temperature)
         total = counts.sum()
         policy = counts / total if total > 0 else counts
