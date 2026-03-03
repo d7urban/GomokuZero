@@ -34,6 +34,7 @@ from gomoku import (
     EMPTY,
     PLAYER1,
     PLAYER2,
+    WIN_LENGTH,
     GomokuGame,
     mcts_begin,
     mcts_expand_root,
@@ -1123,6 +1124,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
     def _refresh_board(self):
         glyph = {EMPTY: ".", PLAYER1: "X", PLAYER2: "O"}
         last_move = self._last_move()
+        winning_cells = self._winning_line_cells()
         analysis_pi, analysis_max = self._analysis_overlay()
 
         for r in range(BOARD_SIZE):
@@ -1132,7 +1134,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
                 btn.setText(glyph[val])
                 color, weight = self._apply_cell_font(btn, val)
                 bg, border = self._cell_bg_border(
-                    r, c, val, last_move, analysis_pi, analysis_max
+                    r, c, val, last_move, winning_cells, analysis_pi, analysis_max
                 )
                 self._set_button_style(btn, color, weight, bg, border)
                 self._set_cell_tooltip(btn, val, r, c, analysis_pi)
@@ -1147,6 +1149,50 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
             return None
         last = self.game.move_history[-1]
         return int(last[0]), int(last[1])
+
+    def _winning_line_cells(self):
+        if not self.game_over or not self.game.move_history:
+            return set()
+
+        row, col, player = self.game.move_history[-1]
+        row = int(row)
+        col = int(col)
+        player = int(player)
+
+        if (
+            row < 0 or row >= BOARD_SIZE
+            or col < 0 or col >= BOARD_SIZE
+            or int(self.game.board[row, col]) != player
+        ):
+            return set()
+
+        for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
+            cells = [(row, col)]
+
+            rr, cc = row + dr, col + dc
+            while (
+                0 <= rr < BOARD_SIZE
+                and 0 <= cc < BOARD_SIZE
+                and int(self.game.board[rr, cc]) == player
+            ):
+                cells.append((rr, cc))
+                rr += dr
+                cc += dc
+
+            rr, cc = row - dr, col - dc
+            while (
+                0 <= rr < BOARD_SIZE
+                and 0 <= cc < BOARD_SIZE
+                and int(self.game.board[rr, cc]) == player
+            ):
+                cells.insert(0, (rr, cc))
+                rr -= dr
+                cc -= dc
+
+            if len(cells) >= WIN_LENGTH:
+                return set(cells)
+
+        return set()
 
     def _analysis_overlay(self):
         if (
@@ -1177,7 +1223,13 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         btn.setFont(f)
         return color, weight
 
-    def _cell_bg_border(self, row, col, val, last_move, analysis_pi, analysis_max):
+    def _cell_bg_border(self, row, col, val, last_move, winning_cells, analysis_pi, analysis_max):
+        if (row, col) in winning_cells:
+            if val == PLAYER1:
+                return "#ffd8d8", "2px solid #c83a3a"
+            if val == PLAYER2:
+                return "#dbe9ff", "2px solid #2b63bd"
+            return "#ffe9a8", "2px solid #d49100"
         if last_move is not None and last_move == (row, col):
             return "#ffe9a8", "2px solid #d49100"
         if val == EMPTY and analysis_pi is not None and analysis_max > 0.0:

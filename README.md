@@ -151,9 +151,9 @@ Play against the trained AI:
 python play.py
 
 # Pick a difficulty tier
-python play.py --difficulty easy    # 100 sims
-python play.py --difficulty medium  # 400 sims (default)
-python play.py --difficulty hard    # 1600 sims
+python play.py --difficulty easy    # 250 sims
+python play.py --difficulty medium  # 500 sims (default)
+python play.py --difficulty hard    # 2000 sims
 
 # Or set a custom sim count directly
 python play.py --difficulty 2500    # custom sims ("Custom" in UI)
@@ -183,6 +183,7 @@ python play_qt.py
 - Difficulty tiers and custom simulation counts
 - Analysis heatmap mode: continuous MCTS pondering on the human turn, with
   per-move shading and policy tooltips on empty intersections
+- Winning-line highlight at game end
 
 ## Architecture
 

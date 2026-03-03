@@ -28,7 +28,12 @@ weights-run-1/
 weights-run-2/
 weights-run-3/
 weights-run-4/
+weights-run-5/
+weights-run-6/
+weights-10-run-1/
+weights-10-run-2/
 botb-weights/
+weights-historical/
 Mixed-competitor-weights/
 game*.json
 *.h5

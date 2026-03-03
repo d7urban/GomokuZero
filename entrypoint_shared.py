@@ -21,12 +21,12 @@ from gomoku import (
 )
 
 # Common play defaults.
-AI_SIMULATIONS = 400
+AI_SIMULATIONS = 500
 AI_MCTS_BATCH = 8
 DIFFICULTY_SIMS = {
-    "easy": 100,
-    "medium": 400,
-    "hard": 1600,
+    "easy": 250,
+    "medium": 500,
+    "hard": 2000,
 }
 
 BEST_WEIGHTS = "weights/gomoku_best.weights.h5"
