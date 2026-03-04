@@ -9,10 +9,12 @@ Usage:
 Description:
   Repeats this cycle until train_state game_count reaches --games-goal:
     1) run train.py (uses effective GZ_NUM_GAMES per run; falls back to train.py default)
-    2) run eval_tournament.py --tournament-dir <dir>
+    2) run eval_tournament.py --tournament-dir <dir> --mode swiss-sprt
+       (defaults to --sprt-max-challengers 4)
   Auto-sets Swiss rounds each cycle from player count in tournament dir:
     <=70 players -> 6 rounds, 71-140 -> 7 rounds, >140 -> 8 rounds
-  Pass --swiss-rounds in extra tournament args to override.
+  Pass --swiss-rounds, --mode, and/or --sprt-max-challengers in extra
+  tournament args to override.
 
 Examples:
   ./train_tournament_loop.sh --games-goal 50000
@@ -138,6 +140,50 @@ has_swiss_rounds_override() {
   return 1
 }
 
+has_mode_override() {
+  local arg
+  for arg in "${tournament_extra_args[@]}"; do
+    case "$arg" in
+      --mode|--mode=*)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+resolve_mode_from_extra() {
+  local i arg
+  for ((i=0; i<${#tournament_extra_args[@]}; i++)); do
+    arg="${tournament_extra_args[$i]}"
+    case "$arg" in
+      --mode=*)
+        printf '%s\n' "${arg#--mode=}"
+        return 0
+        ;;
+      --mode)
+        if ((i + 1 < ${#tournament_extra_args[@]})); then
+          printf '%s\n' "${tournament_extra_args[$((i + 1))]}"
+          return 0
+        fi
+        ;;
+    esac
+  done
+  return 1
+}
+
+has_sprt_max_challengers_override() {
+  local arg
+  for arg in "${tournament_extra_args[@]}"; do
+    case "$arg" in
+      --sprt-max-challengers|--sprt-max-challengers=*)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
 count_tournament_players() {
   local dir="$1"
   if [[ ! -d "$dir" ]]; then
@@ -218,6 +264,25 @@ while ((current_games < games_goal)); do
   echo
   echo "=== Cycle $cycle: eval_tournament.py ==="
   tournament_args=(--tournament-dir "$tournament_dir")
+  effective_mode="swiss-sprt"
+  if has_mode_override; then
+    resolved_mode="$(resolve_mode_from_extra || true)"
+    if [[ -n "${resolved_mode:-}" ]]; then
+      effective_mode="$resolved_mode"
+    fi
+    echo "Tournament mode: using explicit value from extra args."
+  else
+    tournament_args+=(--mode swiss-sprt)
+    echo "Tournament mode: defaulting to swiss-sprt."
+  fi
+  if [[ "$effective_mode" == "swiss-sprt" ]]; then
+    if has_sprt_max_challengers_override; then
+      echo "SPRT max challengers: using explicit value from extra args."
+    else
+      tournament_args+=(--sprt-max-challengers 4)
+      echo "SPRT max challengers: defaulting to 4."
+    fi
+  fi
   if has_swiss_rounds_override; then
     echo "Swiss rounds: using explicit value from extra args."
   else

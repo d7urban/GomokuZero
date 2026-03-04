@@ -82,12 +82,18 @@ Run the training+tournament cycle until a total game goal:
 ```
 
 `train_tournament_loop.sh` runs `train.py` (`GZ_NUM_GAMES` games/chunk; default 5,000),
-then `eval_tournament.py`, and repeats until `weights/train_state.pkl` reaches
-`--games-goal`. Both module calls in the loop run with `2>/dev/null`.
+then `eval_tournament.py --mode swiss-sprt`, and repeats until
+`weights/train_state.pkl` reaches `--games-goal`. Both module calls in the loop
+run with `2>/dev/null`.
+By default in `swiss-sprt` mode, it also sets `--sprt-max-challengers 4`.
 It auto-selects Swiss rounds per cycle by tournament player count:
 `<=70 -> 6`, `71-140 -> 7`, `>140 -> 8`.
 To override this, pass `--swiss-rounds` after `--`, e.g.
 `./train_tournament_loop.sh --games-goal 120000 -- --swiss-rounds 7`.
+You can also override mode explicitly, e.g.
+`./train_tournament_loop.sh --games-goal 120000 -- --mode swiss-mcmahon`.
+To override the challenger cap, pass e.g.
+`./train_tournament_loop.sh --games-goal 120000 -- --sprt-max-challengers 8`.
 
 ### Evaluation
 
@@ -119,6 +125,9 @@ python eval_tournament.py --tournament-dir botb-weights --swiss-rounds 6 --mcmah
 # Tournament without touching persistent ratings / best checkpoint files
 python eval_tournament.py --tournament-dir botb-weights --no-persist-ratings --no-promote-winner
 
+# Hybrid Swiss + SPRT mode (faster challenger filtering with confidence target)
+python eval_tournament.py --tournament-dir botb-weights --mode swiss-sprt --certainty 0.95
+
 # Run eval without changing persistent ratings
 python eval.py --no-rating-update
 
@@ -129,8 +138,10 @@ python ratings_glicko2.py Mixed-competitor-weights/glicko2_ratings.pkl --min-gam
 
 Standard eval runs update persistent Glicko-2 ratings in `weights/glicko2_ratings.pkl`.
 Tournament mode (`eval_tournament.py`) is persistent by default. It runs Swiss
-seeding across all checkpoints, then a McMahon final group selected by rating
-bar, and writes outputs inside the tournament folder by default:
+seeding across all checkpoints, then either:
+- a McMahon final group selected by rating bar (`--mode swiss-mcmahon`, default), or
+- a sequential SPRT challenger ladder over a Swiss shortlist (`--mode swiss-sprt`).
+It writes outputs inside the tournament folder by default:
 `<tournament-dir>/glicko2_ratings.pkl`,
 `<tournament-dir>/gomoku_best.weights.h5`,
 `<tournament-dir>/best_checkpoint.pkl`.
