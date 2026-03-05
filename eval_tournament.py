@@ -716,6 +716,8 @@ def _resolve_sprt_settings(config, n_tests):
     max_games = max(min_games, int(config["sprt_max_games"]))
     openings_step = max(1, int(config["sprt_openings_step"]))
 
+    llr_win = math.log(score1 / score0)
+    llr_loss = math.log((1.0 - score1) / (1.0 - score0))
     upper = math.log((1.0 - beta) / alpha)
     lower = math.log(beta / (1.0 - alpha))
 
@@ -726,6 +728,8 @@ def _resolve_sprt_settings(config, n_tests):
         "beta": beta,
         "score0": score0,
         "score1": score1,
+        "llr_win": llr_win,
+        "llr_loss": llr_loss,
         "upper": upper,
         "lower": lower,
         "min_games": min_games,
@@ -836,6 +840,15 @@ def _run_sprt_duel(
             decision = "accept_h0"
             break
 
+        remaining = sprt["max_games"] - total
+        if remaining > 0:
+            llr_max_reachable = llr + float(remaining) * float(sprt["llr_win"])
+            llr_min_reachable = llr + float(remaining) * float(sprt["llr_loss"])
+            if llr_max_reachable < sprt["upper"] and llr_min_reachable > sprt["lower"]:
+                decision = "inconclusive_futility"
+                print("  SPRT decision: INCONCLUSIVE (bounds unreachable with remaining games)")
+                break
+
     total = wins + losses + draws
     score = float(wins) + 0.5 * float(draws)
     score_rate = score / max(1.0, float(total))
@@ -856,6 +869,8 @@ def _run_sprt_duel(
         print("  SPRT decision: ACCEPT H1 (challenger is stronger)")
     elif decision == "accept_h0":
         print("  SPRT decision: ACCEPT H0 (challenger not stronger)")
+    elif decision == "inconclusive_futility":
+        print("  SPRT decision: INCONCLUSIVE (early futility stop)")
     else:
         print("  SPRT decision: INCONCLUSIVE (max games reached)")
 
