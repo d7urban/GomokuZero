@@ -1475,8 +1475,13 @@ def run_tournament(args, run_match_fn, eval_batch_size, print_gpu_status_fn=None
     if swiss_top_n is not None and len(weight_paths) > swiss_top_n:
         weight_paths = sorted(
             weight_paths,
-            key=lambda p: -float(
-                get_glicko2_entry(ratings_table, p, create=False).get("rating", GLICKO2_RATING0)
+            key=lambda p: (
+                -float(
+                    get_glicko2_entry(ratings_table, p, create=False).get(
+                        "rating", GLICKO2_RATING0
+                    )
+                ),
+                -_checkpoint_game_count(p),  # tiebreak: newer checkpoint wins
             ),
         )[:int(swiss_top_n)]
         arch_by_path = {p: arch_by_path[p] for p in weight_paths}
