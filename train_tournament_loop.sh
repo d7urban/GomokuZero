@@ -193,7 +193,7 @@ count_tournament_players() {
   find "$dir" -maxdepth 1 -type f \
     \( -name "*.weights.h5" -o -name "*.h5" -o -name "*.keras" \) \
     -printf '%f\n' \
-    | awk 'tolower($0)!="gomoku_best.weights.h5" && tolower($0)!="gomoku_weights.weights.h5" && tolower($0)!~/^gomoku_.*_final\.weights\.h5$/ {c++} END {print c+0}'
+    | awk 'tolower($0)!="gomoku_best.weights.h5" && tolower($0)!="gomoku_weights.weights.h5" && tolower($0)!~/^gomoku_.*_final\.weights\.h5$/ && tolower($0)!~/^gomoku_.*_interrupted\.weights\.h5$/ {c++} END {print c+0}'
 }
 
 auto_swiss_rounds_for_players() {

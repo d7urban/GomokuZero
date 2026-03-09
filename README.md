@@ -134,7 +134,7 @@ Outputs are written inside the tournament folder by default:
 `<tournament-dir>/glicko2_ratings.pkl`, `<tournament-dir>/gomoku_best.weights.h5`,
 `<tournament-dir>/best_checkpoint.pkl`.
 Discovery automatically excludes `gomoku_best.weights.h5`, `gomoku_weights.weights.h5`,
-and `gomoku_*_final.weights.h5`.
+and `gomoku_*_final.weights.h5`, and `gomoku_*_interrupted.weights.h5`.
 
 ```bash
 # Basic run (Swiss -> McMahon, default mode)

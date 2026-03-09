@@ -80,6 +80,7 @@ TOURNEY_EXCLUDED_BASENAMES = {
 }
 TOURNEY_EXCLUDED_BASENAME_PATTERNS = (
     re.compile(r"^gomoku_.*_final\.weights\.h5$"),
+    re.compile(r"^gomoku_.*_interrupted\.weights\.h5$"),
 )
 
 
