@@ -46,6 +46,7 @@ TOURNEY_SWISS_SIMS = 50
 TOURNEY_SWISS_OPENINGS = 4   # 8 games per pairing per round
 TOURNEY_SWISS_ROUNDS = 6
 TOURNEY_SWISS_BATCH_SIZE = 16
+TOURNEY_SWISS_ALWAYS_NEWEST = 5  # guaranteed slots for newest checkpoints when --swiss-top-n is set
 
 # McMahon final stage (top bar-selected players)
 TOURNEY_MCM_SIMS = 160
@@ -246,6 +247,7 @@ def _build_config(args, eval_batch_size):
     # top-N group size overrides
     swiss_top_n_raw = _cfg(args, "swiss_top_n", None)
     swiss_top_n = max(2, int(swiss_top_n_raw)) if swiss_top_n_raw is not None else None
+    swiss_always_newest = max(0, int(_cfg(args, "swiss_always_newest", TOURNEY_SWISS_ALWAYS_NEWEST)))
 
     mcmahon_min_players = int(_cfg(args, "mcmahon_min_players", TOURNEY_MCM_MIN_PLAYERS))
     mcmahon_max_players = int(_cfg(args, "mcmahon_max_players", TOURNEY_MCM_MAX_PLAYERS))
@@ -270,6 +272,7 @@ def _build_config(args, eval_batch_size):
         "swiss_rounds": _cfg(args, "swiss_rounds", TOURNEY_SWISS_ROUNDS),
         "swiss_batch_size": swiss_batch_size,
         "swiss_top_n": swiss_top_n,
+        "swiss_always_newest": swiss_always_newest,
         "mcmahon_sims": _cfg(args, "mcmahon_sims", TOURNEY_MCM_SIMS),
         "mcmahon_openings": _cfg(args, "mcmahon_openings", TOURNEY_MCM_OPENINGS),
         "mcmahon_rounds": _cfg(args, "mcmahon_rounds", TOURNEY_MCM_ROUNDS),
@@ -1163,7 +1166,11 @@ def _print_tournament_config(config):
     print("Tournament format:")
     print(f"  Mode: {mode}")
     swiss_top_n = config.get("swiss_top_n")
-    swiss_field = f"top {swiss_top_n}" if swiss_top_n is not None else "all"
+    if swiss_top_n is not None:
+        always_newest = config.get("swiss_always_newest", 0)
+        swiss_field = f"top {swiss_top_n} ({always_newest} newest guaranteed)"
+    else:
+        swiss_field = "all"
     print(f"  Swiss seeding:  {config['swiss_rounds']} rounds  "
           f"@ {config['swiss_sims']} sims, batch {config['swiss_batch_size']}, "
           f"{config['swiss_openings'] * 2} games/pairing  [{swiss_field} players]")
@@ -1473,19 +1480,29 @@ def run_tournament(args, run_match_fn, eval_batch_size, print_gpu_status_fn=None
 
     swiss_top_n = config.get("swiss_top_n")
     if swiss_top_n is not None and len(weight_paths) > swiss_top_n:
-        weight_paths = sorted(
-            weight_paths,
+        always_newest = min(config.get("swiss_always_newest", 0), int(swiss_top_n))
+        # Reserve guaranteed slots for the newest checkpoints (by game count).
+        by_recency = sorted(weight_paths, key=lambda p: -_checkpoint_game_count(p))
+        newest_paths = by_recency[:always_newest]
+        newest_set = set(newest_paths)
+        # Fill remaining slots from rated pool (best rating first, then newest).
+        rated_pool = sorted(
+            (p for p in weight_paths if p not in newest_set),
             key=lambda p: (
                 -float(
                     get_glicko2_entry(ratings_table, p, create=False).get(
                         "rating", GLICKO2_RATING0
                     )
                 ),
-                -_checkpoint_game_count(p),  # tiebreak: newer checkpoint wins
+                -_checkpoint_game_count(p),
             ),
-        )[:int(swiss_top_n)]
+        )
+        rated_slots = int(swiss_top_n) - len(newest_paths)
+        weight_paths = newest_paths + rated_pool[:rated_slots]
         arch_by_path = {p: arch_by_path[p] for p in weight_paths}
-        print(f"Swiss field capped to top {swiss_top_n} by Glicko-2 rating.")
+        newest_names = ", ".join(os.path.basename(p) for p in newest_paths)
+        print(f"Swiss field capped to top {swiss_top_n} "
+              f"({len(newest_paths)} newest guaranteed: {newest_names}).")
         print()
 
     mode = str(config.get("mode", TOURNEY_MODE))
@@ -1633,6 +1650,11 @@ def _build_tournament_parser():
     parser.add_argument("--swiss-top-n", type=int, default=None,
                         help="Limit Swiss field to top N players by Glicko-2 rating "
                              "(default: all)")
+    parser.add_argument("--swiss-always-newest", type=int,
+                        default=TOURNEY_SWISS_ALWAYS_NEWEST,
+                        help="When --swiss-top-n is set, guarantee this many slots "
+                             "for the newest checkpoints regardless of rating "
+                             f"(default: {TOURNEY_SWISS_ALWAYS_NEWEST})")
 
     parser.add_argument("--mcmahon-rounds", type=int, default=TOURNEY_MCM_ROUNDS,
                         help=f"McMahon rounds (default: {TOURNEY_MCM_ROUNDS})")

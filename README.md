@@ -174,6 +174,7 @@ python eval_tournament.py --tournament-dir botb-weights --no-persist-ratings --n
 | Flag | Default | Description |
 |---|---|---|
 | `--swiss-top-n N` | all | Cap the Swiss field to the top N players by existing Glicko-2 rating. Also sets the default for `--mcmahon-top-n` and `--sprt-top-n` unless those are specified separately. Requires persistent ratings from a prior run to be meaningful. |
+| `--swiss-always-newest N` | `5` | When `--swiss-top-n` is set, unconditionally reserve N slots for the checkpoints with the highest game count (most recently trained), regardless of their rating. Ensures new unrated nets are always evaluated. Has no effect without `--swiss-top-n`. |
 | `--mcmahon-top-n N` | all | Cap McMahon finalists to N players. Overrides `--mcmahon-max-players`. Defaults to `--swiss-top-n` if set. |
 | `--sprt-top-n N` | all | Cap the SPRT finalist shortlist to N players (swiss-sprt mode). Defaults to `--swiss-top-n` if set. |
 
