@@ -94,6 +94,8 @@ You can also override mode explicitly, e.g.
 `./train_tournament_loop.sh --games-goal 120000 -- --mode swiss-mcmahon`.
 To override the challenger cap, pass e.g.
 `./train_tournament_loop.sh --games-goal 120000 -- --sprt-max-challengers 8`.
+To focus tournament evaluation on only the strongest nets, pass e.g.
+`./train_tournament_loop.sh --games-goal 120000 -- --swiss-top-n 12`.
 
 ### Evaluation
 
@@ -112,22 +114,6 @@ python eval.py --openings 200
 # Calibrate strength between sim tiers on one checkpoint
 python eval.py --checkpoint weights/gomoku_best.weights.h5 --calibrate-sims --sim-levels 100,400,1600
 
-# Run tournament across all weight files in a folder
-# (Swiss seeding -> McMahon final, no heads-up)
-python eval_tournament.py --tournament-dir botb-weights
-
-# Tournament with practical-tie (shared-gold) settings
-python eval_tournament.py --tournament-dir botb-weights --shared-gold-margin 0.02 --shared-gold-min-games 120
-
-# Large field example (hundreds of checkpoints)
-python eval_tournament.py --tournament-dir botb-weights --swiss-rounds 6 --mcmahon-rounds 5 --mcmahon-max-players 24
-
-# Tournament without touching persistent ratings / best checkpoint files
-python eval_tournament.py --tournament-dir botb-weights --no-persist-ratings --no-promote-winner
-
-# Hybrid Swiss + SPRT mode (faster challenger filtering with confidence target)
-python eval_tournament.py --tournament-dir botb-weights --mode swiss-sprt --certainty 0.95
-
 # Run eval without changing persistent ratings
 python eval.py --no-rating-update
 
@@ -137,22 +123,107 @@ python ratings_glicko2.py Mixed-competitor-weights/glicko2_ratings.pkl --min-gam
 ```
 
 Standard eval runs update persistent Glicko-2 ratings in `weights/glicko2_ratings.pkl`.
-Tournament mode (`eval_tournament.py`) is persistent by default. It runs Swiss
-seeding across all checkpoints, then either:
+
+### Tournament (`eval_tournament.py`)
+
+Runs Swiss seeding across all checkpoints, then either:
 - a McMahon final group selected by rating bar (`--mode swiss-mcmahon`, default), or
 - a sequential SPRT challenger ladder over a Swiss shortlist (`--mode swiss-sprt`).
-It writes outputs inside the tournament folder by default:
-`<tournament-dir>/glicko2_ratings.pkl`,
-`<tournament-dir>/gomoku_best.weights.h5`,
+
+Outputs are written inside the tournament folder by default:
+`<tournament-dir>/glicko2_ratings.pkl`, `<tournament-dir>/gomoku_best.weights.h5`,
 `<tournament-dir>/best_checkpoint.pkl`.
-Default tournament sims are `--swiss-sims 50` and `--mcmahon-sims 160`.
-Default tournament MCTS batch sizes are `--swiss-batch-size 16` and
-`--mcmahon-batch-size 8`.
-Tournament discovery automatically excludes
-`gomoku_best.weights.h5`, `gomoku_weights.weights.h5`, and
-`gomoku_*_final.weights.h5`.
-Use `--no-persist-ratings --no-promote-winner` for dry-run/transient behavior.
-`eval.py --tournament-dir ...` remains supported as a compatibility wrapper.
+Discovery automatically excludes `gomoku_best.weights.h5`, `gomoku_weights.weights.h5`,
+and `gomoku_*_final.weights.h5`.
+
+```bash
+# Basic run (Swiss -> McMahon, default mode)
+python eval_tournament.py --tournament-dir botb-weights
+
+# Focus on the 12 strongest nets (Swiss + McMahon + SPRT all capped)
+python eval_tournament.py --tournament-dir botb-weights --swiss-top-n 12
+
+# Cap only the McMahon final to 10 players (Swiss still runs over all)
+python eval_tournament.py --tournament-dir botb-weights --mcmahon-top-n 10
+
+# Swiss+SPRT mode with top-N focus and challenger cap
+python eval_tournament.py --tournament-dir botb-weights \
+    --mode swiss-sprt --swiss-top-n 12 --sprt-top-n 8 --sprt-max-challengers 4
+
+# Large field (hundreds of checkpoints), limit to known-strong group
+python eval_tournament.py --tournament-dir botb-weights --swiss-top-n 20 --swiss-rounds 6
+
+# Dry run: no ratings written, no best-checkpoint update
+python eval_tournament.py --tournament-dir botb-weights --no-persist-ratings --no-promote-winner
+```
+
+#### All flags
+
+**General**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--tournament-dir DIR` | *(required)* | Directory containing checkpoint weight files |
+| `--mode MODE` | `swiss-mcmahon` | Tournament mode: `swiss-mcmahon` or `swiss-sprt` |
+| `--certainty FLOAT` | `0.95` | SPRT mode only: overall confidence target for strongest-net selection |
+| `--seed INT` | *(fixed)* | RNG seed for opening book generation |
+| `--plies INT` | *(fixed)* | Random plies per opening position |
+
+**Top-N group size (focus on the strongest nets)**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--swiss-top-n N` | all | Cap the Swiss field to the top N players by existing Glicko-2 rating. Also sets the default for `--mcmahon-top-n` and `--sprt-top-n` unless those are specified separately. Requires persistent ratings from a prior run to be meaningful. |
+| `--mcmahon-top-n N` | all | Cap McMahon finalists to N players. Overrides `--mcmahon-max-players`. Defaults to `--swiss-top-n` if set. |
+| `--sprt-top-n N` | all | Cap the SPRT finalist shortlist to N players (swiss-sprt mode). Defaults to `--swiss-top-n` if set. |
+
+**Swiss seeding stage**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--swiss-rounds N` | `6` | Number of Swiss pairing rounds |
+| `--swiss-sims N` | `50` | MCTS simulations per move during Swiss |
+| `--swiss-openings N` | `4` | Opening positions per round (×2 = games per pairing) |
+| `--swiss-batch-size N` | `16` | MCTS leaf batch size during Swiss |
+
+**McMahon final stage** (`--mode swiss-mcmahon`)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--mcmahon-rounds N` | `5` | Number of McMahon pairing rounds |
+| `--mcmahon-sims N` | `160` | MCTS simulations per move during McMahon |
+| `--mcmahon-openings N` | `8` | Opening positions per round (×2 = games per pairing) |
+| `--mcmahon-batch-size N` | `32` | MCTS leaf batch size during McMahon |
+| `--mcmahon-bar-gap FLOAT` | `80.0` | Include players within this many rating points of the leader in the final group |
+| `--mcmahon-min-players N` | `8` | Minimum finalists (expands group if bar-gap yields fewer) |
+| `--mcmahon-max-players N` | `24` | Maximum finalists (truncates group if bar-gap yields more) |
+| `--shared-gold-margin FLOAT` | `0.02` | Declare shared gold if top two are within this win-probability of 50/50 |
+| `--shared-gold-min-games N` | `120` | Minimum head-to-head games before shared gold can be declared |
+
+**SPRT ladder stage** (`--mode swiss-sprt`)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--sprt-max-challengers N` | `12` | Maximum challengers tested in the SPRT ladder (incumbent + N duels) |
+| `--sprt-score0 FLOAT` | `0.50` | H0 expected score (null hypothesis: no improvement) |
+| `--sprt-score1 FLOAT` | `0.55` | H1 expected score (alternative: challenger is stronger) |
+| `--sprt-min-games N` | `32` | Minimum games before SPRT can reach a decision |
+| `--sprt-max-games N` | `320` | Maximum games per SPRT duel |
+| `--sprt-openings-step N` | `4` | Openings per SPRT update chunk (×2 = games per chunk) |
+| `--sprt-sims N` | *(mcmahon-sims)* | MCTS sims per move for SPRT duels |
+| `--sprt-batch-size N` | *(mcmahon-batch-size)* | MCTS batch size for SPRT duels |
+| `--sprt-alpha FLOAT` | *(derived)* | Override SPRT Type-I error rate (default: derived from `--certainty`) |
+| `--sprt-beta FLOAT` | *(derived)* | Override SPRT Type-II error rate (default: derived from `--certainty`) |
+
+**Ratings and output**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--persist-ratings` / `--no-persist-ratings` | enabled | Load and save persistent Glicko-2 ratings file |
+| `--ratings-file PATH` | `<tournament-dir>/glicko2_ratings.pkl` | Path to persistent ratings file |
+| `--promote-winner` / `--no-promote-winner` | enabled | Copy tournament champion to `gomoku_best.weights.h5` |
+| `--best-weights-file PATH` | `<tournament-dir>/gomoku_best.weights.h5` | Destination for promoted best weights |
+| `--best-state-file PATH` | `<tournament-dir>/best_checkpoint.pkl` | Destination for promoted best-state metadata |
 
 ### Playing
 

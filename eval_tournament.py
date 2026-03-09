@@ -51,7 +51,7 @@ TOURNEY_SWISS_BATCH_SIZE = 16
 TOURNEY_MCM_SIMS = 160
 TOURNEY_MCM_OPENINGS = 8     # 16 games per pairing per round
 TOURNEY_MCM_ROUNDS = 5
-TOURNEY_MCM_BATCH_SIZE = 8
+TOURNEY_MCM_BATCH_SIZE = 32
 TOURNEY_MCM_BAR_GAP = 80.0   # include players within this rating gap from leader
 TOURNEY_MCM_MIN_PLAYERS = 8
 TOURNEY_MCM_MAX_PLAYERS = 24
@@ -241,6 +241,26 @@ def _build_config(args, eval_batch_size):
     sprt_batch_size = int(
         mcmahon_batch_size if sprt_batch_size_raw is None else sprt_batch_size_raw
     )
+
+    # top-N group size overrides
+    swiss_top_n_raw = _cfg(args, "swiss_top_n", None)
+    swiss_top_n = max(2, int(swiss_top_n_raw)) if swiss_top_n_raw is not None else None
+
+    mcmahon_min_players = int(_cfg(args, "mcmahon_min_players", TOURNEY_MCM_MIN_PLAYERS))
+    mcmahon_max_players = int(_cfg(args, "mcmahon_max_players", TOURNEY_MCM_MAX_PLAYERS))
+    mcmahon_top_n_raw = _cfg(args, "mcmahon_top_n", None)
+    effective_mcmahon_top_n = (
+        max(2, int(mcmahon_top_n_raw)) if mcmahon_top_n_raw is not None else swiss_top_n
+    )
+    if effective_mcmahon_top_n is not None:
+        mcmahon_max_players = effective_mcmahon_top_n
+        mcmahon_min_players = min(effective_mcmahon_top_n, mcmahon_min_players)
+
+    sprt_top_n_raw = _cfg(args, "sprt_top_n", None)
+    sprt_top_n = (
+        max(2, int(sprt_top_n_raw)) if sprt_top_n_raw is not None else swiss_top_n
+    )
+
     return {
         "mode": mode,
         "certainty": certainty,
@@ -248,17 +268,15 @@ def _build_config(args, eval_batch_size):
         "swiss_openings": _cfg(args, "swiss_openings", TOURNEY_SWISS_OPENINGS),
         "swiss_rounds": _cfg(args, "swiss_rounds", TOURNEY_SWISS_ROUNDS),
         "swiss_batch_size": swiss_batch_size,
+        "swiss_top_n": swiss_top_n,
         "mcmahon_sims": _cfg(args, "mcmahon_sims", TOURNEY_MCM_SIMS),
         "mcmahon_openings": _cfg(args, "mcmahon_openings", TOURNEY_MCM_OPENINGS),
         "mcmahon_rounds": _cfg(args, "mcmahon_rounds", TOURNEY_MCM_ROUNDS),
         "mcmahon_batch_size": mcmahon_batch_size,
         "mcmahon_bar_gap": float(_cfg(args, "mcmahon_bar_gap", TOURNEY_MCM_BAR_GAP)),
-        "mcmahon_min_players": int(
-            _cfg(args, "mcmahon_min_players", TOURNEY_MCM_MIN_PLAYERS)
-        ),
-        "mcmahon_max_players": int(
-            _cfg(args, "mcmahon_max_players", TOURNEY_MCM_MAX_PLAYERS)
-        ),
+        "mcmahon_min_players": mcmahon_min_players,
+        "mcmahon_max_players": mcmahon_max_players,
+        "sprt_top_n": sprt_top_n,
         "sprt_score0": float(_cfg(args, "sprt_score0", TOURNEY_SPRT_SCORE0)),
         "sprt_score1": float(_cfg(args, "sprt_score1", TOURNEY_SPRT_SCORE1)),
         "sprt_min_games": max(2, int(_cfg(args, "sprt_min_games", TOURNEY_SPRT_MIN_GAMES))),
@@ -306,7 +324,7 @@ def _save_ratings_table_if_enabled(config, ratings_table):
 
 
 def _checkpoint_game_count(path):
-    m = re.search(r"_g(\d{5})\.weights\.h5$", os.path.basename(path))
+    m = re.search(r"_g(\d+)\.weights\.h5$", os.path.basename(path))
     if not m:
         return 0
     return int(m.group(1))
@@ -917,7 +935,10 @@ def _run_swiss_sprt_stage(
     ratings_table = swiss["ratings_table"]
     _print_tourney_standings(ratings_table, weight_paths, limit=15)
 
-    finalists, bar_rating, _ = _select_mcmahon_finalists(weight_paths, ratings_table, config)
+    finalists, bar_rating, _ = _select_mcmahon_finalists(
+        weight_paths, ratings_table, config,
+        max_players_override=config.get("sprt_top_n"),
+    )
     if len(finalists) < 2:
         print("SPRT finalist selection produced fewer than two players.")
         return None, ratings_table
@@ -1018,7 +1039,7 @@ def _run_swiss_sprt_stage(
     return final, ratings_table
 
 
-def _select_mcmahon_finalists(weight_paths, ratings_table, config):
+def _select_mcmahon_finalists(weight_paths, ratings_table, config, max_players_override=None):
     rows = _tourney_rows(ratings_table, weight_paths)
     total = len(rows)
     if total == 0:
@@ -1026,7 +1047,10 @@ def _select_mcmahon_finalists(weight_paths, ratings_table, config):
 
     bar_gap = float(config["mcmahon_bar_gap"])
     min_players = max(2, int(config["mcmahon_min_players"]))
-    max_players = max(min_players, int(config["mcmahon_max_players"]))
+    if max_players_override is not None:
+        max_players = max(min_players, int(max_players_override))
+    else:
+        max_players = max(min_players, int(config["mcmahon_max_players"]))
     min_players = min(min_players, total)
     max_players = min(max_players, total)
 
@@ -1137,10 +1161,18 @@ def _print_tournament_config(config):
     mode = str(config.get("mode", TOURNEY_MODE))
     print("Tournament format:")
     print(f"  Mode: {mode}")
+    swiss_top_n = config.get("swiss_top_n")
+    swiss_field = f"top {swiss_top_n}" if swiss_top_n is not None else "all"
     print(f"  Swiss seeding:  {config['swiss_rounds']} rounds  "
           f"@ {config['swiss_sims']} sims, batch {config['swiss_batch_size']}, "
-          f"{config['swiss_openings'] * 2} games/pairing")
+          f"{config['swiss_openings'] * 2} games/pairing  [{swiss_field} players]")
     if mode == "swiss-sprt":
+        sprt_top_n = config.get("sprt_top_n")
+        shortlist_str = f"top {sprt_top_n}" if sprt_top_n is not None else (
+            f"bar gap {config['mcmahon_bar_gap']:.1f}, "
+            f"min {config['mcmahon_min_players']}, "
+            f"max {config['mcmahon_max_players']}"
+        )
         print("  SPRT ladder:    challengers from Swiss shortlist")
         print(f"    Certainty target: {100.0 * float(config['certainty']):.1f}%")
         print(f"    Hypotheses: H0 score={float(config['sprt_score0']):.3f}, "
@@ -1151,16 +1183,15 @@ def _print_tournament_config(config):
               f"@ {int(config['sprt_sims'])} sims, "
               f"batch {int(config['sprt_batch_size'])}")
         print(f"    Max challengers: {int(config['sprt_max_challengers'])}")
-        print(f"  Swiss shortlist:  bar gap {config['mcmahon_bar_gap']:.1f}, "
-              f"min {config['mcmahon_min_players']}, "
-              f"max {config['mcmahon_max_players']}")
+        print(f"  Swiss shortlist:  {shortlist_str}")
     else:
+        mcmahon_top_n = config.get("mcmahon_max_players")
         print(f"  McMahon final:  {config['mcmahon_rounds']} rounds  "
               f"@ {config['mcmahon_sims']} sims, batch {config['mcmahon_batch_size']}, "
               f"{config['mcmahon_openings'] * 2} games/pairing")
         print(f"  McMahon bar gap: {config['mcmahon_bar_gap']:.1f} rating points")
         print(f"  McMahon field:   min {config['mcmahon_min_players']} / "
-              f"max {config['mcmahon_max_players']} players")
+              f"max {mcmahon_top_n} players")
         print(f"  Shared gold:     50/50 ± {100.0 * config['shared_gold_margin']:.1f}% "
               f"(min {config['shared_gold_min_games']} games)")
     print()
@@ -1439,6 +1470,18 @@ def run_tournament(args, run_match_fn, eval_batch_size, print_gpu_status_fn=None
     for path in weight_paths:
         get_glicko2_entry(ratings_table, path, create=True)
 
+    swiss_top_n = config.get("swiss_top_n")
+    if swiss_top_n is not None and len(weight_paths) > swiss_top_n:
+        weight_paths = sorted(
+            weight_paths,
+            key=lambda p: -float(
+                get_glicko2_entry(ratings_table, p, create=False).get("rating", GLICKO2_RATING0)
+            ),
+        )[:int(swiss_top_n)]
+        arch_by_path = {p: arch_by_path[p] for p in weight_paths}
+        print(f"Swiss field capped to top {swiss_top_n} by Glicko-2 rating.")
+        print()
+
     mode = str(config.get("mode", TOURNEY_MODE))
     if mode == "swiss-sprt":
         final, ratings_table = _run_swiss_sprt_stage(
@@ -1581,6 +1624,9 @@ def _build_tournament_parser():
                              f"(default: {TOURNEY_SWISS_OPENINGS})")
     parser.add_argument("--swiss-batch-size", type=int, default=TOURNEY_SWISS_BATCH_SIZE,
                         help=f"Swiss MCTS batch size (default: {TOURNEY_SWISS_BATCH_SIZE})")
+    parser.add_argument("--swiss-top-n", type=int, default=None,
+                        help="Limit Swiss field to top N players by Glicko-2 rating "
+                             "(default: all)")
 
     parser.add_argument("--mcmahon-rounds", type=int, default=TOURNEY_MCM_ROUNDS,
                         help=f"McMahon rounds (default: {TOURNEY_MCM_ROUNDS})")
@@ -1600,6 +1646,9 @@ def _build_tournament_parser():
     parser.add_argument("--mcmahon-max-players", type=int, default=TOURNEY_MCM_MAX_PLAYERS,
                         help=f"Maximum McMahon finalists "
                              f"(default: {TOURNEY_MCM_MAX_PLAYERS})")
+    parser.add_argument("--mcmahon-top-n", type=int, default=None,
+                        help="Cap McMahon finalists to top N "
+                             "(overrides --mcmahon-max-players; default: all)")
     parser.add_argument("--sprt-score0", type=float, default=TOURNEY_SPRT_SCORE0,
                         help=f"SPRT H0 expected score (default: {TOURNEY_SPRT_SCORE0:.2f})")
     parser.add_argument("--sprt-score1", type=float, default=TOURNEY_SPRT_SCORE1,
@@ -1622,6 +1671,9 @@ def _build_tournament_parser():
                         default=TOURNEY_SPRT_MAX_CHALLENGERS,
                         help="Max Swiss challengers tested in SPRT ladder "
                              f"(default: {TOURNEY_SPRT_MAX_CHALLENGERS})")
+    parser.add_argument("--sprt-top-n", type=int, default=None,
+                        help="Cap SPRT finalist shortlist to top N players "
+                             "(default: all; in swiss-sprt mode)")
     parser.add_argument("--sprt-alpha", type=float, default=None,
                         help="Override SPRT Type-I error (default: derived from --certainty)")
     parser.add_argument("--sprt-beta", type=float, default=None,
