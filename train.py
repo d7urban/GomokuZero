@@ -17,6 +17,7 @@ Architecture: single-process, GPU-accelerated.
 import numpy as np
 import math
 import os, pickle, time, signal, shutil
+import re
 from datetime import datetime
 from collections import deque
 
@@ -127,7 +128,10 @@ ASYM_DECAY_GAMES  = 3000         # linear decay over this many games
 # Random opening plies: play this many random moves before MCTS kicks in.
 # Creates diverse starting positions and breaks defensive symmetry.
 RANDOM_OPENING_PLIES = 6
-BOOK_OPENING_FRAC    = 0.30    # fraction of games that use book openings
+BOOK_OPENING_FRAC    = 0.30    # among non-empty starts, fraction that use book openings
+EMPTY_OPENING_FRAC   = min(1.0, _env_float(
+    "GZ_EMPTY_OPENING_FRAC", 0.40, min_value=0.0
+))  # fraction of games that start from true empty board
 
 # Best-opponent play: fraction of games played against the current best
 # checkpoint instead of self-play.  Forces the network to learn how to
@@ -1177,6 +1181,19 @@ def _train_step(model, optimizer, states, target_pi, target_v, pi_weights):
 BEST_WEIGHTS_FILE = "weights/gomoku_best.weights.h5"
 BEST_STATE_FILE   = "weights/best_checkpoint.pkl"
 
+
+def _best_state_game_count_from_path(path):
+    if not path:
+        return 0
+    m = re.search(r"_g(\d+)\.weights\.h5$", os.path.basename(str(path)))
+    if not m:
+        return 0
+    try:
+        return int(m.group(1))
+    except Exception:
+        return 0
+
+
 def _load_best_state():
     default = {"path": None, "game_count": 0, "glicko2_vs_long": None}
     if os.path.exists(BEST_STATE_FILE):
@@ -1187,9 +1204,13 @@ def _load_best_state():
                 # Backward compatibility with older saved key name.
                 if "glicko2_vs_long" not in state:
                     state["glicko2_vs_long"] = state.get("elo_vs_long")
+                path = state.get("path")
+                game_count = int(state.get("game_count", 0) or 0)
+                if game_count <= 0:
+                    game_count = _best_state_game_count_from_path(path)
                 return {
-                    "path": state.get("path"),
-                    "game_count": int(state.get("game_count", 0) or 0),
+                    "path": path,
+                    "game_count": game_count,
                     "glicko2_vs_long": state.get("glicko2_vs_long"),
                 }
         except Exception:
@@ -1576,8 +1597,14 @@ def _setup_training_run():
               f"until replay reaches {MCTS_SIMS_WARMUP_REPLAY:,} positions")
     print(f"Asymmetric play: {ASYM_FRAC_START:.0%}→{ASYM_FRAC_END:.0%} "
           f"over {ASYM_DECAY_GAMES} games, weak side {ASYM_WEAK_SIMS} sims")
-    print(f"Openings: {BOOK_OPENING_FRAC:.0%} book, "
-          f"{1-BOOK_OPENING_FRAC:.0%} random ({RANDOM_OPENING_PLIES} plies)")
+    non_empty_opening_frac = max(0.0, 1.0 - EMPTY_OPENING_FRAC)
+    book_opening_total_frac = BOOK_OPENING_FRAC * non_empty_opening_frac
+    random_opening_total_frac = non_empty_opening_frac - book_opening_total_frac
+    print(
+        f"Openings: {EMPTY_OPENING_FRAC:.0%} empty, "
+        f"{book_opening_total_frac:.0%} book, "
+        f"{random_opening_total_frac:.0%} random ({RANDOM_OPENING_PLIES} plies)"
+    )
     print(f"Soft resign: threshold {RESIGN_THRESHOLD}, "
           f"{RESIGN_CONSECUTIVE} consecutive, after move {RESIGN_MIN_MOVES} "
           f"(value-only, fast sims from current self-play budget; target {PCAP_FAST_SIMS})")
@@ -1787,6 +1814,8 @@ def _loop_batch_schedule(game_count, target, loop_state=None):
 
 
 def _select_self_play_opening(book_openings):
+    if np.random.random() < EMPTY_OPENING_FRAC:
+        return 0
     if book_openings and np.random.random() < BOOK_OPENING_FRAC:
         return book_openings[np.random.randint(len(book_openings))]
     return RANDOM_OPENING_PLIES

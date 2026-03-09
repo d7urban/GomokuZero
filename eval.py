@@ -60,7 +60,7 @@ from ratings_glicko2 import (
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 EVAL_SIMS         = 100    # MCTS simulations per move (same for both sides)
-EVAL_BATCH_SIZE   = 8      # MCTS batch size
+EVAL_BATCH_SIZE   = 32     # MCTS batch size
 EVAL_GAMES        = 200    # games per matchup (100 openings × 2 color swaps)
 
 
@@ -108,6 +108,17 @@ def _parse_sim_levels(spec):
         raise ValueError("need at least two distinct sim levels")
     return vals
 
+
+def _checkpoint_game_count(path_or_name):
+    m = re.search(r"_g(\d+)\.weights\.h5$", os.path.basename(str(path_or_name)))
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
 # ── Checkpoint discovery ────────────────────────────────────────────────────
 def find_checkpoints(weights_dir="weights"):
     """Find all timestamped checkpoints and return sorted by game count.
@@ -115,13 +126,12 @@ def find_checkpoints(weights_dir="weights"):
     Returns list of (game_count, filepath) sorted ascending.
     Excludes 'latest', 'final', 'interrupted', and temp files.
     """
-    pattern = os.path.join(weights_dir, "gomoku_*_g?????.weights.h5")
+    pattern = os.path.join(weights_dir, "gomoku_*_g*.weights.h5")
     files = glob.glob(pattern)
     checkpoints = []
     for f in files:
-        m = re.search(r"_g(\d{5})\.weights\.h5$", f)
-        if m:
-            game_count = int(m.group(1))
+        game_count = _checkpoint_game_count(f)
+        if game_count is not None:
             checkpoints.append((game_count, f))
     checkpoints.sort()
     return checkpoints
@@ -433,7 +443,18 @@ def _resolve_best_state_game_count(weights_dir):
             best_state = pickle.load(f)
     except Exception:
         return None
-    return best_state.get("game_count")
+    if not isinstance(best_state, dict):
+        return None
+
+    raw_gc = best_state.get("game_count")
+    try:
+        game_count = int(raw_gc) if raw_gc is not None else None
+    except Exception:
+        game_count = None
+
+    if game_count is not None and game_count > 0:
+        return game_count
+    return _checkpoint_game_count(best_state.get("path"))
 
 
 def _resolve_explicit_candidate(args, checkpoints):
