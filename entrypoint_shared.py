@@ -22,7 +22,7 @@ from gomoku import (
 
 # Common play defaults.
 AI_SIMULATIONS = 500
-AI_MCTS_BATCH = 8
+AI_MCTS_BATCH = 32
 DIFFICULTY_SIMS = {
     "easy": 250,
     "medium": 500,

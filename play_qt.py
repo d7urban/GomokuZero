@@ -6,6 +6,7 @@ Includes Human-vs-AI (play.py feature parity) and Human-vs-Human modes using
 widgets instead of curses/CLI prompts.
 """
 
+import glob
 import os
 import sys
 import time
@@ -39,7 +40,6 @@ from gomoku import (
     mcts_begin,
     mcts_expand_root,
     mcts_process_results,
-    mcts_policy,
     mcts_select_leaves,
 )
 from entrypoint_shared import (
@@ -111,6 +111,18 @@ class AnalysisWorker(QtCore.QThread):
     def request_stop(self):
         self._running = False
 
+    def _emit_snapshot(self, ctx):
+        root = ctx["root"]
+        counts = np.zeros(BOARD_SIZE * BOARD_SIZE, dtype=np.float32)
+        q_vals = np.full(BOARD_SIZE * BOARD_SIZE, np.nan, dtype=np.float32)
+        for (r, c), child in root.children.items():
+            counts[r * BOARD_SIZE + c] = child.visit_count
+            if child.visit_count:
+                q_vals[r * BOARD_SIZE + c] = -child.q_value  # flip to current-player perspective
+        self.analysis_update.emit(
+            (self.session_id, counts, q_vals, float(root.q_value), int(ctx["sims_done"]))
+        )
+
     def run(self):
         try:
             ctx, root_state = mcts_begin(
@@ -125,41 +137,73 @@ class AnalysisWorker(QtCore.QThread):
             logits_np, values_np = self.predict_fn(root_batch)
             mcts_expand_root(ctx, logits_np[0], values_np.ravel()[0])
 
+            # Double-buffer pipeline: while the GPU computes batch N, the CPU
+            # selects leaves for batch N+1.  predict_fn._raw is the underlying
+            # @tf.function; calling it enqueues the GPU op and returns TF tensors
+            # immediately.  Calling .numpy() on them blocks until the GPU is done.
+            _raw = self.predict_fn._raw
             last_emit = 0.0
+
+            # Pipeline slot holds the ctx state + in-flight TF tensors for the
+            # batch that was just dispatched to the GPU.
+            slot_pending = slot_eval_list = slot_n_batch = None
+            slot_tf_logits = slot_tf_values = None
+            slot_has_data = False
+
             while self._running and ctx["sims_done"] < ctx["sims_target"]:
+                # ── Phase A: CPU tree traversal ──────────────────────────────
+                # GPU is running the previous batch in the background here.
                 leaf_states = mcts_select_leaves(ctx)
+                cur_pending, cur_eval_list, cur_n_batch = (
+                    ctx["pending"], ctx["eval_list"], ctx["n_batch"]
+                )
                 if leaf_states:
-                    batch = np.array(leaf_states, dtype=np.float32)
-                    b_logits, b_values = self.predict_fn(batch)
-                    mcts_process_results(ctx, b_logits, b_values.ravel())
+                    cur_batch = np.array(leaf_states, dtype=np.float32)
+                    cur_tf_logits, cur_tf_values = _raw(cur_batch)  # async GPU launch
+                else:
+                    cur_tf_logits = cur_tf_values = None
+
+                # ── Phase B: sync GPU result + backprop for previous batch ───
+                if slot_has_data:
+                    ctx["pending"] = slot_pending
+                    ctx["eval_list"] = slot_eval_list
+                    ctx["n_batch"] = slot_n_batch
+                    if slot_tf_logits is not None:
+                        # .numpy() blocks here; GPU has been running since Phase A
+                        mcts_process_results(
+                            ctx,
+                            slot_tf_logits.numpy(),
+                            slot_tf_values.numpy().ravel(),
+                        )
+                    else:
+                        mcts_process_results(ctx)
+
+                    now = time.time()
+                    if now - last_emit >= self.emit_interval:
+                        self._emit_snapshot(ctx)
+                        last_emit = now
+
+                slot_pending, slot_eval_list, slot_n_batch = (
+                    cur_pending, cur_eval_list, cur_n_batch
+                )
+                slot_tf_logits, slot_tf_values = cur_tf_logits, cur_tf_values
+                slot_has_data = True
+
+            # ── Drain: process the last outstanding batch ────────────────────
+            if slot_has_data:
+                ctx["pending"] = slot_pending
+                ctx["eval_list"] = slot_eval_list
+                ctx["n_batch"] = slot_n_batch
+                if slot_tf_logits is not None:
+                    mcts_process_results(
+                        ctx,
+                        slot_tf_logits.numpy(),
+                        slot_tf_values.numpy().ravel(),
+                    )
                 else:
                     mcts_process_results(ctx)
 
-                now = time.time()
-                if now - last_emit >= self.emit_interval:
-                    root = ctx["root"]
-                    pi = mcts_policy(root, board_size=BOARD_SIZE, temperature=1.0)
-                    self.analysis_update.emit(
-                        (
-                            self.session_id,
-                            pi,
-                            float(root.q_value),
-                            int(ctx["sims_done"]),
-                        )
-                    )
-                    last_emit = now
-
-            # Emit one final snapshot if we computed anything.
-            root = ctx["root"]
-            pi = mcts_policy(root, board_size=BOARD_SIZE, temperature=1.0)
-            self.analysis_update.emit(
-                (
-                    self.session_id,
-                    pi,
-                    float(root.q_value),
-                    int(ctx["sims_done"]),
-                )
-            )
+            self._emit_snapshot(ctx)
         except Exception as e:
             self.analysis_error.emit(self.session_id, str(e))
 
@@ -186,6 +230,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
         self.analysis_worker = None
         self.analysis_session_id = 0
         self.analysis_policy = None
+        self.analysis_q = None
         self.analysis_root_q = None
         self.analysis_sims_done = 0
         self.analysis_started_at = 0.0
@@ -638,6 +683,16 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
     def _auto_load_startup_model(self):
         if self._is_human_only():
             return
+        cwd_files = glob.glob("*.weights.h5")
+        if cwd_files:
+            cwd_files.sort(key=os.path.getmtime, reverse=True)
+            self._load_model_from_selection(
+                mode="file",
+                explicit_path=cwd_files[0],
+                show_errors=False,
+                startup=True,
+            )
+            return
         self._load_model_from_selection(
             mode="best",
             explicit_path="",
@@ -1044,6 +1099,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
             return
         self.analysis_session_id += 1
         self.analysis_policy = None
+        self.analysis_q = None
         self.analysis_root_q = 0.0
         self.analysis_sims_done = 0
         self.analysis_started_at = time.time()
@@ -1074,6 +1130,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
                     self.analysis_worker = None
         if clear:
             self.analysis_policy = None
+            self.analysis_q = None
             self.analysis_root_q = None
             self.analysis_sims_done = 0
             self.analysis_started_at = 0.0
@@ -1093,10 +1150,11 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
             self._stop_analysis(wait=False, clear=True)
 
     def _on_analysis_update(self, payload):
-        session_id, policy, root_q, sims_done = payload
+        session_id, policy, q_vals, root_q, sims_done = payload
         if int(session_id) != int(self.analysis_session_id):
             return
         self.analysis_policy = np.asarray(policy, dtype=np.float32).ravel()
+        self.analysis_q = np.asarray(q_vals, dtype=np.float32).ravel()
         self.analysis_root_q = float(root_q)
         self.analysis_sims_done = int(sims_done)
         if self.analysis_started_at <= 0.0:
@@ -1109,6 +1167,7 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
             return
         self.analysis_label.setText(f"Error: {err_text}")
         self.analysis_policy = None
+        self.analysis_q = None
         self.analysis_root_q = None
         self.analysis_sims_done = 0
         self.analysis_started_at = 0.0
@@ -1131,8 +1190,21 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
             for c in range(BOARD_SIZE):
                 val = int(self.game.board[r, c])
                 btn = self.board_buttons[r][c]
-                btn.setText(glyph[val])
+                text = glyph[val]
+                if val == EMPTY and analysis_pi is not None and analysis_max > 0.0:
+                    p = float(analysis_pi[r * BOARD_SIZE + c])
+                    if p >= 50.0 and self.analysis_q is not None:
+                        q = float(self.analysis_q[r * BOARD_SIZE + c])
+                        if not np.isnan(q):
+                            text = f"{round((q + 1) / 2 * 100)}%"
+                btn.setText(text)
                 color, weight = self._apply_cell_font(btn, val)
+                if text.endswith("%"):
+                    cell_px = max(1, min(btn.width(), btn.height()))
+                    f = btn.font()
+                    f.setPixelSize(max(10, int(cell_px * 0.45)))
+                    btn.setFont(f)
+                    color, weight = "#000000", 700
                 bg, border = self._cell_bg_border(
                     r, c, val, last_move, winning_cells, analysis_pi, analysis_max
                 )
@@ -1234,7 +1306,9 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
             return "#ffe9a8", "2px solid #d49100"
         if val == EMPTY and analysis_pi is not None and analysis_max > 0.0:
             p = float(analysis_pi[row * BOARD_SIZE + col])
-            t = max(0.0, min(1.0, p / analysis_max))
+            if p < 50.0:
+                return "#f5f5f5", "1px solid #b8b8b8"
+            t = float(np.log1p(p) / np.log1p(analysis_max))
             rr = int(245 - 125 * t)
             gg = int(245 - 25 * t)
             bb = int(245 - 125 * t)
@@ -1261,8 +1335,10 @@ class GomokuQtWindow(QtWidgets.QMainWindow):
 
     def _set_cell_tooltip(self, btn, val, row, col, analysis_pi):
         if val == EMPTY and analysis_pi is not None:
-            p = float(analysis_pi[row * BOARD_SIZE + col])
-            btn.setToolTip(f"MCTS policy: {100.0 * p:.2f}%")
+            visits = float(analysis_pi[row * BOARD_SIZE + col])
+            total = float(analysis_pi.sum())
+            pct = 100.0 * visits / total if total > 0.0 else 0.0
+            btn.setToolTip(f"Visits: {int(visits)} ({pct:.1f}%)")
             return
         btn.setToolTip("")
 

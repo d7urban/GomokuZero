@@ -391,6 +391,13 @@ def make_predict_fn(model):
         logits, values = _predict(x)
         return logits.numpy(), values.numpy()
 
+    # Expose the raw tf.function so callers can launch GPU work asynchronously.
+    # Calling _predict(x) enqueues GPU ops and returns TF tensors immediately
+    # (before the GPU finishes).  Calling .numpy() on those tensors blocks until
+    # the result is ready.  This lets the CPU do other work (e.g. MCTS tree
+    # traversal) while the GPU computes, overlapping the two phases.
+    predict_np._raw = _predict
+
     return predict_np
 
 
@@ -648,6 +655,37 @@ def mcts_search(game, model, num_simulations=200, c_puct=1.5,
 
 
 # ── Batched MCTS (virtual loss) ────────────────────────────────────────────
+def _backprop_batch(pending, eval_list, logits_np, values_np, game_size):
+    """Expand leaf nodes from NN output and backpropagate values.
+
+    Shared by both the synchronous and pipelined paths of mcts_search_batched.
+    logits_np / values_np may be None when eval_list is empty (all-terminal round).
+    """
+    VIRTUAL_LOSS = 1.0
+    if eval_list and logits_np is not None:
+        values_flat = values_np.ravel()
+        for j, e in enumerate(eval_list):
+            logits_j = logits_np[j].ravel()
+            value_j = float(values_flat[j])
+            if e["moves"]:
+                _expand_from_output(e["node"], e["moves"], logits_j, value_j, game_size)
+            else:
+                value_j = 0.0
+            for idx in e["indices"]:
+                pending[idx]["value"] = value_j
+
+    for p in pending:
+        path = p["path"]
+        value = p["value"] if p["value"] is not None else 0.0
+        for n in path[1:]:
+            n.visit_count -= 1
+            n.value_sum -= VIRTUAL_LOSS
+        for n in reversed(path):
+            n.visit_count += 1
+            n.value_sum += value
+            value = -value
+
+
 def mcts_search_batched(game, model, num_simulations=200, batch_size=8,
                         c_puct=1.5, add_noise=True, dirichlet_alpha=0.15,
                         noise_frac=0.25):
@@ -660,6 +698,10 @@ def mcts_search_batched(game, model, num_simulations=200, batch_size=8,
 
     Uses a single scratch game with make/undo instead of copying the game
     for each path, which is much cheaper on CPU.
+
+    When model exposes a ._raw tf.function (set by make_predict_fn), uses
+    double-buffering: the GPU evaluates batch N while the CPU selects leaves
+    for batch N+1, hiding GPU latency behind CPU tree-traversal work.
     """
     VIRTUAL_LOSS = 1.0
 
@@ -670,12 +712,20 @@ def mcts_search_batched(game, model, num_simulations=200, batch_size=8,
         _add_dirichlet_noise(root, dirichlet_alpha, noise_frac)
 
     scratch = game.copy()   # single scratch game, reused for all paths
+    _raw = getattr(model, '_raw', None)
 
     sims_done = 0
+    # Pipeline slot: stash previous batch while GPU runs, process it next iter.
+    slot_pending = slot_eval_list = None
+    slot_tf_logits = slot_tf_values = None
+    slot_n_batch = 0
+    slot_has_data = False
+
     while sims_done < num_simulations:
         n_batch = min(batch_size, num_simulations - sims_done)
 
         # ── Phase 1: select paths with virtual loss ─────────────────
+        # (GPU is computing the previous batch in the background here)
         pending = []
         seen_leaves = {}  # id(node) → index into pending (first occurrence)
 
@@ -722,15 +772,13 @@ def mcts_search_batched(game, model, num_simulations=200, batch_size=8,
                 "leaf_moves": leaf_moves,
             })
 
-        # ── Phase 2: batch-evaluate non-terminal unexpanded leaves ──
-        # Build unique eval set using pre-computed states from phase 1.
+        # ── Build unique eval set ────────────────────────────────────
         unique_evals = {}   # id(node) → {state, moves, node, indices}
         for i, p in enumerate(pending):
             if p["terminal"] is not None:
                 continue
             nid = id(p["node"])
             if nid not in unique_evals:
-                # Use state from the first path that reached this leaf
                 first_idx = seen_leaves[nid]
                 unique_evals[nid] = {
                     "state": pending[first_idx]["leaf_state"],
@@ -741,44 +789,52 @@ def mcts_search_batched(game, model, num_simulations=200, batch_size=8,
             else:
                 unique_evals[nid]["indices"].append(i)
 
-        if unique_evals:
-            eval_list = list(unique_evals.values())
-            batch_states = np.array([e["state"] for e in eval_list])
-            batch_logits, batch_values = _call_predict(model, batch_states)
-            batch_values = batch_values.ravel()
+        eval_list = list(unique_evals.values()) if unique_evals else []
 
-            for j, e in enumerate(eval_list):
-                logits_j = batch_logits[j].ravel()
-                value_j = float(batch_values[j])
-                node = e["node"]
-                moves = e["moves"]
+        if _raw is not None:
+            # ── Async path: launch GPU for current batch ─────────────
+            if eval_list:
+                batch_states = np.array([e["state"] for e in eval_list])
+                cur_tf_logits, cur_tf_values = _raw(batch_states)
+            else:
+                cur_tf_logits = cur_tf_values = None
 
-                if moves:
-                    _expand_from_output(node, moves, logits_j, value_j,
-                                        game.size)
+            # Process previous slot: .numpy() syncs the GPU result, then
+            # expand + backprop (GPU has been running during Phase 1 above).
+            if slot_has_data:
+                if slot_tf_logits is not None:
+                    logits_np = slot_tf_logits.numpy()
+                    values_np = slot_tf_values.numpy()
                 else:
-                    value_j = 0.0   # draw
+                    logits_np = values_np = None
+                _backprop_batch(slot_pending, slot_eval_list,
+                                logits_np, values_np, game.size)
+                sims_done += slot_n_batch
 
-                for idx in e["indices"]:
-                    pending[idx]["value"] = value_j
+            slot_pending, slot_eval_list = pending, eval_list
+            slot_tf_logits, slot_tf_values = cur_tf_logits, cur_tf_values
+            slot_n_batch = n_batch
+            slot_has_data = True
 
-        # ── Phase 3: undo virtual loss, then normal backup ──────────
-        for p in pending:
-            path = p["path"]
-            value = p["value"] if p["value"] is not None else 0.0
+        else:
+            # ── Sync path: original behaviour (no ._raw available) ───
+            if eval_list:
+                batch_states = np.array([e["state"] for e in eval_list])
+                logits_np, values_np = _call_predict(model, batch_states)
+            else:
+                logits_np = values_np = None
+            _backprop_batch(pending, eval_list, logits_np, values_np, game.size)
+            sims_done += n_batch
 
-            # Undo virtual loss on every non-root node in the path
-            for n in path[1:]:
-                n.visit_count -= 1
-                n.value_sum -= VIRTUAL_LOSS
-
-            # Standard backup (alternating sign)
-            for n in reversed(path):
-                n.visit_count += 1
-                n.value_sum += value
-                value = -value
-
-        sims_done += n_batch
+    # ── Drain: process the last outstanding slot ─────────────────────────
+    if slot_has_data:
+        if slot_tf_logits is not None:
+            logits_np = slot_tf_logits.numpy()
+            values_np = slot_tf_values.numpy()
+        else:
+            logits_np = values_np = None
+        _backprop_batch(slot_pending, slot_eval_list,
+                        logits_np, values_np, game.size)
 
     return root
 
